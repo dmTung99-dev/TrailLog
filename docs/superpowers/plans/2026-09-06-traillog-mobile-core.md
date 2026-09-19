@@ -1128,12 +1128,21 @@ export class LocationTrackingService {
   private watchId: number | null = null;
   private sequence = 0;
   private backgroundKeepAliveActive = false;
+  private backgroundKeepAliveGeneration = 0;
   private releaseBackgroundTask: (() => void) | null = null;
 
   constructor(
     private readonly onRoutePoint: (point: RoutePointInput) => void,
     private readonly onError?: (error: unknown) => void,
   ) {}
+
+  private reportError(error: unknown): void {
+    if (this.onError) {
+      this.onError(error);
+    } else {
+      console.warn('[LocationTrackingService]', error);
+    }
+  }
 
   get state() {
     return this.stateMachine.state;
@@ -1178,7 +1187,7 @@ export class LocationTrackingService {
         this.sequence += 1;
       },
       (error) => {
-        this.onError?.(error);
+        this.reportError(error);
       },
       { enableHighAccuracy: true, distanceFilter: 5, interval: 5000 },
     );
@@ -1204,18 +1213,24 @@ export class LocationTrackingService {
       // actually invoking the task callback (see the design note).
     }
     this.backgroundKeepAliveActive = true;
+    this.backgroundKeepAliveGeneration += 1;
+    const generation = this.backgroundKeepAliveGeneration;
 
     // BackgroundActions treats a resolved task promise as "the task is
     // done" and immediately tears the foreground service down — so this
     // promise must stay pending until stopBackgroundKeepAlive() releases
-    // it, never resolve on its own. Exception: if we've already been
-    // stopped/paused again by the time the native side finally invokes
-    // this callback, resolve immediately instead of parking a resolver
-    // nothing will ever call.
+    // it, never resolve on its own. Exception: if a pause()+resume() cycle
+    // already happened by the time the native side finally invokes this
+    // callback, `generation` will no longer match — this specific task is
+    // stale (superseded by a newer one), so resolve it immediately instead
+    // of parking a resolver nothing will ever call. Checking
+    // `backgroundKeepAliveActive` alone isn't enough here: after a
+    // pause()+resume(), that flag is true again (set by the new call), so
+    // a stale task's callback would wrongly think it's still current.
     BackgroundActions.start(
       () =>
         new Promise<void>((resolve) => {
-          if (!this.backgroundKeepAliveActive) {
+          if (!this.backgroundKeepAliveActive || generation !== this.backgroundKeepAliveGeneration) {
             resolve();
             return;
           }
@@ -1223,7 +1238,7 @@ export class LocationTrackingService {
         }),
       BACKGROUND_TASK_OPTIONS,
     ).catch((error: unknown) => {
-      this.onError?.(error);
+      this.reportError(error);
     });
   }
 
@@ -1235,7 +1250,7 @@ export class LocationTrackingService {
     this.releaseBackgroundTask?.();
     this.releaseBackgroundTask = null;
     BackgroundActions.stop().catch((error: unknown) => {
-      this.onError?.(error);
+      this.reportError(error);
     });
   }
 }
@@ -1247,7 +1262,9 @@ Add the dependency: `npm install react-native-geolocation-service react-native-b
 
 The fix above separates the two jobs the old code conflated: `watchPosition` is now called synchronously in `beginWatching()` itself, independent of any background-task machinery, so `watchId` is always set before `start()`/`resume()` return. `BackgroundActions.start()` is now used purely to hold a promise open (via `startBackgroundKeepAlive()`/`stopBackgroundKeepAlive()`) so Android doesn't suspend the process while backgrounded — it never gates whether GPS watching happens. `pause()` now also releases that keep-alive task (mirroring `stop()`), and `resume()` restarts it via `beginWatching()`. An `onError` callback was added to the constructor so geolocation and background-service failures are actually observable instead of being silently swallowed, and the two `BackgroundActions` calls are `.catch()`-handled so a native failure becomes a callback invocation, not an unhandled promise rejection.
 
-**Second design note (from re-review after the first fix):** the first fix above still had one hole: `startBackgroundKeepAlive()`'s "already running" guard originally checked `releaseBackgroundTask`, which the real library only assigns once the native side actually invokes the task callback — a later, unpredictable tick, not synchronous with `BackgroundActions.start()` being called. A quick `pause()` immediately followed by `resume()` could run entirely before that native callback ever fired; when it finally did fire (against the now-resumed service), it would assign `releaseBackgroundTask` on a session `resume()` had already moved past, and the *next* `startBackgroundKeepAlive()` call would see that stale non-null value and silently skip starting a new native task — permanently losing the foreground service for the rest of that run, with no error and no visible symptom until Android killed the backgrounded app. The fix replaces that guard with `backgroundKeepAliveActive`, a plain boolean set synchronously the instant `startBackgroundKeepAlive()` runs (not dependent on native timing at all), and has the task callback itself check that flag when it does eventually fire: if we've already moved on, it resolves itself immediately instead of parking a resolver nothing will ever call again.
+**Second design note (from re-review after the first fix):** the first fix above still had one hole: `startBackgroundKeepAlive()`'s "already running" guard originally checked `releaseBackgroundTask`, which the real library only assigns once the native side actually invokes the task callback — a later, unpredictable tick, not synchronous with `BackgroundActions.start()` being called. A quick `pause()` immediately followed by `resume()` could run entirely before that native callback ever fired; when it finally did fire (against the now-resumed service), it would assign `releaseBackgroundTask` on a session `resume()` had already moved past, and the *next* `startBackgroundKeepAlive()` call would see that stale non-null value and silently skip starting a new native task — permanently losing the foreground service for the rest of that run, with no error and no visible symptom until Android killed the backgrounded app.
+
+**Third design note (a plain boolean guard turned out not to be enough — caught by actually running this task's own test):** the first pass at fixing the above replaced the guard with a plain `backgroundKeepAliveActive` boolean, set synchronously the instant `startBackgroundKeepAlive()` runs. That is *not* sufficient on its own, and the class above reflects the corrected version, not that intermediate one: after a `pause()` immediately followed by `resume()`, `backgroundKeepAliveActive` is back to `true` (set by `resume()`'s own call) by the time the stale first task's callback finally fires — so checking only that flag makes the stale task wrongly conclude it's still the current one, and it parks its resolver instead of self-resolving, reproducing the same class of bug one level down. The class above adds `backgroundKeepAliveGeneration`, a counter incremented each time `startBackgroundKeepAlive()` runs; each task callback closes over the generation number that was current when *it* was created, and checks that number against the current one (not just the boolean) before deciding whether it's stale. This was caught only because the fixing engineer ran the test the previous design note specified against the previous note's own proposed code, rather than trusting the prose — a reminder that a design note in this document is a claim, not a proof, until its test actually passes.
 
 Add to `android/app/src/main/AndroidManifest.xml`, inside `<manifest>` and `<application>` respectively:
 
