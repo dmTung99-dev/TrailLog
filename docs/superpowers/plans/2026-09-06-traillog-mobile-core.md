@@ -835,7 +835,7 @@ git commit -m "feat: add accelerometer-based step detector and pedometer service
 
 **Interfaces:**
 - Consumes: `RoutePointInput` shape from Task 2's `activitiesRepository`.
-- Produces: `TrackingStateMachine` (states `'idle' | 'recording' | 'paused' | 'stopped'`, method `transition(event)`) and `LocationTrackingService.start()/pause()/resume()/stop()`, emitting `RoutePointInput`-shaped objects via `onRoutePoint` — this is what Task 6's Zustand store subscribes to.
+- Produces: `TrackingStateMachine` (states `'idle' | 'recording' | 'paused' | 'stopped'`, method `transition(event)`) and `LocationTrackingService.start()/pause()/resume()/stop()`, emitting `RoutePointInput`-shaped objects via the constructor's `onRoutePoint` callback — this is what Task 6's Zustand store subscribes to. The constructor also takes an optional second `onError?: (error: unknown) => void` callback; Task 6 may pass one or omit it (both are valid — omitting it is exactly what the existing single-argument construction in Task 6's brief already does).
 
 - [ ] **Step 1: Write the failing state machine test**
 
@@ -980,6 +980,81 @@ describe('LocationTrackingService', () => {
     expect(onRoutePoint).toHaveBeenNthCalledWith(2, expect.objectContaining({ sequence: 1 }));
     expect(() => service.start()).toThrow('Cannot START from recording');
   });
+
+  describe('on Android', () => {
+    beforeEach(() => {
+      jest.resetModules();
+    });
+
+    it('starts watching synchronously (before any background task callback can fire) and clears it on pause', () => {
+      jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
+        OS: 'android',
+        select: (obj: any) => obj.android,
+      }));
+      jest.doMock('react-native-geolocation-service', () => ({
+        watchPosition: jest.fn().mockReturnValue(1),
+        clearWatch: jest.fn(),
+      }));
+      jest.doMock('react-native-background-actions', () => ({
+        start: jest.fn().mockResolvedValue(undefined),
+        stop: jest.fn().mockResolvedValue(undefined),
+      }));
+
+      const Geo = require('react-native-geolocation-service');
+      const AndroidBackgroundActions = require('react-native-background-actions');
+      const { LocationTrackingService: AndroidLocationTrackingService } = require('./locationTrackingService');
+
+      const service = new AndroidLocationTrackingService(jest.fn());
+      service.start();
+
+      // watchId must already be set — this is the exact race the review caught:
+      // watchPosition used to only run once BackgroundActions' task callback
+      // fired on a later tick, so pause() could miss clearWatch entirely.
+      expect(Geo.watchPosition).toHaveBeenCalledTimes(1);
+      expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(1);
+
+      service.pause();
+      expect(Geo.clearWatch).toHaveBeenCalledWith(1);
+    });
+
+    it('keeps the background task promise pending until stop() releases it', async () => {
+      jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
+        OS: 'android',
+        select: (obj: any) => obj.android,
+      }));
+      jest.doMock('react-native-geolocation-service', () => ({
+        watchPosition: jest.fn().mockReturnValue(1),
+        clearWatch: jest.fn(),
+      }));
+
+      let capturedTask: (() => Promise<void>) | null = null;
+      jest.doMock('react-native-background-actions', () => ({
+        start: jest.fn().mockImplementation((task: () => Promise<void>) => {
+          capturedTask = task;
+          return task();
+        }),
+        stop: jest.fn().mockResolvedValue(undefined),
+      }));
+
+      const { LocationTrackingService: AndroidLocationTrackingService } = require('./locationTrackingService');
+      const service = new AndroidLocationTrackingService(jest.fn());
+      service.start();
+
+      let resolved = false;
+      capturedTask!().then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+      // This is the exact bug the review caught: the old code's task
+      // resolved on its own immediately, which the library reads as "done"
+      // and tears the foreground service down right away.
+      expect(resolved).toBe(false);
+
+      service.stop();
+      await Promise.resolve();
+      expect(resolved).toBe(true);
+    });
+  });
 });
 ```
 
@@ -1010,8 +1085,12 @@ export class LocationTrackingService {
   private readonly stateMachine = new TrackingStateMachine();
   private watchId: number | null = null;
   private sequence = 0;
+  private releaseBackgroundTask: (() => void) | null = null;
 
-  constructor(private readonly onRoutePoint: (point: RoutePointInput) => void) {}
+  constructor(
+    private readonly onRoutePoint: (point: RoutePointInput) => void,
+    private readonly onError?: (error: unknown) => void,
+  ) {}
 
   get state() {
     return this.stateMachine.state;
@@ -1025,10 +1104,8 @@ export class LocationTrackingService {
 
   pause(): void {
     this.stateMachine.transition('PAUSE');
-    if (this.watchId !== null) {
-      Geolocation.clearWatch(this.watchId);
-      this.watchId = null;
-    }
+    this.stopWatching();
+    this.stopBackgroundKeepAlive();
   }
 
   resume(): void {
@@ -1038,45 +1115,82 @@ export class LocationTrackingService {
 
   stop(): void {
     this.stateMachine.transition('STOP');
+    this.stopWatching();
+    this.stopBackgroundKeepAlive();
+  }
+
+  private beginWatching(): void {
+    // watchPosition is called synchronously, right here, so watchId is
+    // always set before this method returns — pause()/stop() can never
+    // race a late-firing background task callback (see the design note
+    // below this class).
+    this.watchId = Geolocation.watchPosition(
+      (position) => {
+        this.onRoutePoint({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+          recordedAt: new Date(position.timestamp).toISOString(),
+          sequence: this.sequence,
+        });
+        this.sequence += 1;
+      },
+      (error) => {
+        this.onError?.(error);
+      },
+      { enableHighAccuracy: true, distanceFilter: 5, interval: 5000 },
+    );
+
+    if (Platform.OS === 'android') {
+      this.startBackgroundKeepAlive();
+    }
+    // iOS: relies on UIBackgroundModes: ["location"] in Info.plist; no
+    // separate keep-alive task exists or is needed there.
+  }
+
+  private stopWatching(): void {
     if (this.watchId !== null) {
       Geolocation.clearWatch(this.watchId);
       this.watchId = null;
     }
-    if (Platform.OS === 'android') {
-      BackgroundActions.stop();
-    }
   }
 
-  private beginWatching(): void {
-    const watch = () => {
-      this.watchId = Geolocation.watchPosition(
-        (position) => {
-          this.onRoutePoint({
-            lat: position.coords.latitude,
-            lng: position.coords.longitude,
-            recordedAt: new Date(position.timestamp).toISOString(),
-            sequence: this.sequence,
-          });
-          this.sequence += 1;
-        },
-        () => {
-          /* Errors surface to the UI via the tracking store in Task 6, not thrown here. */
-        },
-        { enableHighAccuracy: true, distanceFilter: 5, interval: 5000 },
-      );
-    };
-
-    if (Platform.OS === 'android') {
-      // Keeps the process alive in the background via a foreground service notification.
-      BackgroundActions.start(async () => watch(), BACKGROUND_TASK_OPTIONS);
-    } else {
-      watch(); // iOS: relies on UIBackgroundModes: ["location"] in Info.plist.
+  private startBackgroundKeepAlive(): void {
+    if (this.releaseBackgroundTask) {
+      return; // already running
     }
+    // BackgroundActions treats a resolved task promise as "the task is
+    // done" and immediately tears the foreground service down — so this
+    // promise must stay pending until stopBackgroundKeepAlive() releases
+    // it, never resolve on its own.
+    BackgroundActions.start(
+      () =>
+        new Promise<void>((resolve) => {
+          this.releaseBackgroundTask = resolve;
+        }),
+      BACKGROUND_TASK_OPTIONS,
+    ).catch((error: unknown) => {
+      this.onError?.(error);
+    });
+  }
+
+  private stopBackgroundKeepAlive(): void {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+    this.releaseBackgroundTask?.();
+    this.releaseBackgroundTask = null;
+    BackgroundActions.stop().catch((error: unknown) => {
+      this.onError?.(error);
+    });
   }
 }
 ```
 
 Add the dependency: `npm install react-native-geolocation-service react-native-background-actions`.
+
+**Design note (from Task 5's review):** an earlier version of this class started `Geolocation.watchPosition` *inside* the callback passed to `BackgroundActions.start(async () => watch(), ...)`. Two problems followed from that. First, `async () => watch()` resolves on the very next tick (`watch()` is synchronous), and the `react-native-background-actions` library treats a resolved task as "finished" — it immediately tore the foreground service down again, so background tracking never actually survived the app being backgrounded on Android. Second, because the real library only invokes that callback once the native side has actually started the foreground service (a later tick, not synchronous with `start()` returning), `watchId` could still be `null` when `pause()`/`stop()` ran right after `start()`, silently skipping `clearWatch` and leaking a live GPS subscription that kept feeding route points after the service reported itself paused or stopped.
+
+The fix above separates the two jobs the old code conflated: `watchPosition` is now called synchronously in `beginWatching()` itself, independent of any background-task machinery, so `watchId` is always set before `start()`/`resume()` return. `BackgroundActions.start()` is now used purely to hold a promise open (via `startBackgroundKeepAlive()`/`stopBackgroundKeepAlive()`) so Android doesn't suspend the process while backgrounded — it never gates whether GPS watching happens. `pause()` now also releases that keep-alive task (mirroring `stop()`), and `resume()` restarts it via `beginWatching()`. An `onError` callback was added to the constructor so geolocation and background-service failures are actually observable instead of being silently swallowed, and the two `BackgroundActions` calls are `.catch()`-handled so a native failure becomes a callback invocation, not an unhandled promise rejection.
 
 Add to `android/app/src/main/AndroidManifest.xml`, inside `<manifest>` and `<application>` respectively:
 
