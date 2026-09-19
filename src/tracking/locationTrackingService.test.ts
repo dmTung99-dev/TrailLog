@@ -52,4 +52,79 @@ describe('LocationTrackingService', () => {
     expect(onRoutePoint).toHaveBeenNthCalledWith(2, expect.objectContaining({ sequence: 1 }));
     expect(() => service.start()).toThrow('Cannot START from recording');
   });
+
+  describe('on Android', () => {
+    beforeEach(() => {
+      jest.resetModules();
+    });
+
+    it('starts watching synchronously (before any background task callback can fire) and clears it on pause', () => {
+      jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
+        OS: 'android',
+        select: (obj: any) => obj.android,
+      }));
+      jest.doMock('react-native-geolocation-service', () => ({
+        watchPosition: jest.fn().mockReturnValue(1),
+        clearWatch: jest.fn(),
+      }));
+      jest.doMock('react-native-background-actions', () => ({
+        start: jest.fn().mockResolvedValue(undefined),
+        stop: jest.fn().mockResolvedValue(undefined),
+      }));
+
+      const Geo = require('react-native-geolocation-service');
+      const AndroidBackgroundActions = require('react-native-background-actions');
+      const { LocationTrackingService: AndroidLocationTrackingService } = require('./locationTrackingService');
+
+      const service = new AndroidLocationTrackingService(jest.fn());
+      service.start();
+
+      // watchId must already be set — this is the exact race the review caught:
+      // watchPosition used to only run once BackgroundActions' task callback
+      // fired on a later tick, so pause() could miss clearWatch entirely.
+      expect(Geo.watchPosition).toHaveBeenCalledTimes(1);
+      expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(1);
+
+      service.pause();
+      expect(Geo.clearWatch).toHaveBeenCalledWith(1);
+    });
+
+    it('keeps the background task promise pending until stop() releases it', async () => {
+      jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
+        OS: 'android',
+        select: (obj: any) => obj.android,
+      }));
+      jest.doMock('react-native-geolocation-service', () => ({
+        watchPosition: jest.fn().mockReturnValue(1),
+        clearWatch: jest.fn(),
+      }));
+
+      let capturedTask: (() => Promise<void>) | null = null;
+      jest.doMock('react-native-background-actions', () => ({
+        start: jest.fn().mockImplementation((task: () => Promise<void>) => {
+          capturedTask = task;
+          return task();
+        }),
+        stop: jest.fn().mockResolvedValue(undefined),
+      }));
+
+      const { LocationTrackingService: AndroidLocationTrackingService } = require('./locationTrackingService');
+      const service = new AndroidLocationTrackingService(jest.fn());
+      service.start();
+
+      let resolved = false;
+      capturedTask!().then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+      // This is the exact bug the review caught: the old code's task
+      // resolved on its own immediately, which the library reads as "done"
+      // and tears the foreground service down right away.
+      expect(resolved).toBe(false);
+
+      service.stop();
+      await Promise.resolve();
+      expect(resolved).toBe(true);
+    });
+  });
 });
