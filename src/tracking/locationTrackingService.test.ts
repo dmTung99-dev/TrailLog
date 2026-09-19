@@ -126,5 +126,47 @@ describe('LocationTrackingService', () => {
       await Promise.resolve();
       expect(resolved).toBe(true);
     });
+
+    it('does not get stuck if pause()/resume() happen before the native side ever invokes the task callback', async () => {
+      jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
+        OS: 'android',
+        select: (obj: any) => obj.android,
+      }));
+      jest.doMock('react-native-geolocation-service', () => ({
+        watchPosition: jest.fn().mockReturnValue(1),
+        clearWatch: jest.fn(),
+      }));
+
+      const capturedTasks: Array<() => Promise<void>> = [];
+      jest.doMock('react-native-background-actions', () => ({
+        // Simulate real Android timing: start()'s own promise resolves
+        // right away, but the task it registers is only invoked later,
+        // by the native side — not synchronously here.
+        start: jest.fn().mockImplementation((task: () => Promise<void>) => {
+          capturedTasks.push(task);
+          return Promise.resolve();
+        }),
+        stop: jest.fn().mockResolvedValue(undefined),
+      }));
+
+      const AndroidBackgroundActions = require('react-native-background-actions');
+      const { LocationTrackingService: AndroidLocationTrackingService } = require('./locationTrackingService');
+      const service = new AndroidLocationTrackingService(jest.fn());
+
+      service.start(); // registers task #1; native hasn't invoked it yet
+      service.pause(); // pauses before native ever gets to it
+      service.resume(); // must register a fresh task, not be blocked by a stale guard
+
+      expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(2);
+
+      // Now let the native side finally get around to invoking the first
+      // (stale) task — it must resolve on its own instead of hanging.
+      let firstTaskResolved = false;
+      capturedTasks[0]().then(() => {
+        firstTaskResolved = true;
+      });
+      await Promise.resolve();
+      expect(firstTaskResolved).toBe(true);
+    });
   });
 });

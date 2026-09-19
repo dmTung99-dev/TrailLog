@@ -17,6 +17,15 @@ export class LocationTrackingService {
   private readonly stateMachine = new TrackingStateMachine();
   private watchId: number | null = null;
   private sequence = 0;
+  private backgroundKeepAliveActive = false;
+  // Distinguishes "this specific startBackgroundKeepAlive() call is still
+  // the current one" from "some keep-alive session is active" — needed
+  // because pause() immediately followed by resume() flips
+  // backgroundKeepAliveActive back to true before the native side ever
+  // invokes the *first* task's callback, so that flag alone can't tell a
+  // superseded (stale) task apart from the current one. See the design
+  // note below this class.
+  private backgroundKeepAliveGeneration = 0;
   private releaseBackgroundTask: (() => void) | null = null;
 
   constructor(
@@ -67,7 +76,7 @@ export class LocationTrackingService {
         this.sequence += 1;
       },
       (error) => {
-        this.onError?.(error);
+        this.reportError(error);
       },
       { enableHighAccuracy: true, distanceFilter: 5, interval: 5000 },
     );
@@ -87,21 +96,35 @@ export class LocationTrackingService {
   }
 
   private startBackgroundKeepAlive(): void {
-    if (this.releaseBackgroundTask) {
-      return; // already running
+    if (this.backgroundKeepAliveActive) {
+      return; // already running — set synchronously below, so this can
+      // never be fooled by how late the native side gets around to
+      // actually invoking the task callback (see the design note).
     }
+    this.backgroundKeepAliveActive = true;
+    const generation = ++this.backgroundKeepAliveGeneration;
+
     // BackgroundActions treats a resolved task promise as "the task is
     // done" and immediately tears the foreground service down — so this
     // promise must stay pending until stopBackgroundKeepAlive() releases
-    // it, never resolve on its own.
+    // it, never resolve on its own. Exception: if we've already moved
+    // past this particular call by the time the native side finally
+    // invokes its callback — either stopped/paused entirely, or
+    // superseded by a later startBackgroundKeepAlive() call (e.g. a
+    // pause() immediately followed by resume()) — resolve immediately
+    // instead of parking a resolver nothing will ever call.
     BackgroundActions.start(
       () =>
         new Promise<void>((resolve) => {
+          if (!this.backgroundKeepAliveActive || generation !== this.backgroundKeepAliveGeneration) {
+            resolve();
+            return;
+          }
           this.releaseBackgroundTask = resolve;
         }),
       BACKGROUND_TASK_OPTIONS,
     ).catch((error: unknown) => {
-      this.onError?.(error);
+      this.reportError(error);
     });
   }
 
@@ -109,10 +132,19 @@ export class LocationTrackingService {
     if (Platform.OS !== 'android') {
       return;
     }
+    this.backgroundKeepAliveActive = false;
     this.releaseBackgroundTask?.();
     this.releaseBackgroundTask = null;
     BackgroundActions.stop().catch((error: unknown) => {
-      this.onError?.(error);
+      this.reportError(error);
     });
+  }
+
+  private reportError(error: unknown): void {
+    if (this.onError) {
+      this.onError(error);
+    } else {
+      console.warn('[LocationTrackingService]', error);
+    }
   }
 }
