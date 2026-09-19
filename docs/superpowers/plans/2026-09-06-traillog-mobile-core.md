@@ -1054,6 +1054,48 @@ describe('LocationTrackingService', () => {
       await Promise.resolve();
       expect(resolved).toBe(true);
     });
+
+    it('does not get stuck if pause()/resume() happen before the native side ever invokes the task callback', async () => {
+      jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
+        OS: 'android',
+        select: (obj: any) => obj.android,
+      }));
+      jest.doMock('react-native-geolocation-service', () => ({
+        watchPosition: jest.fn().mockReturnValue(1),
+        clearWatch: jest.fn(),
+      }));
+
+      const capturedTasks: Array<() => Promise<void>> = [];
+      jest.doMock('react-native-background-actions', () => ({
+        // Simulate real Android timing: start()'s own promise resolves
+        // right away, but the task it registers is only invoked later,
+        // by the native side — not synchronously here.
+        start: jest.fn().mockImplementation((task: () => Promise<void>) => {
+          capturedTasks.push(task);
+          return Promise.resolve();
+        }),
+        stop: jest.fn().mockResolvedValue(undefined),
+      }));
+
+      const AndroidBackgroundActions = require('react-native-background-actions');
+      const { LocationTrackingService: AndroidLocationTrackingService } = require('./locationTrackingService');
+      const service = new AndroidLocationTrackingService(jest.fn());
+
+      service.start(); // registers task #1; native hasn't invoked it yet
+      service.pause(); // pauses before native ever gets to it
+      service.resume(); // must register a fresh task, not be blocked by a stale guard
+
+      expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(2);
+
+      // Now let the native side finally get around to invoking the first
+      // (stale) task — it must resolve on its own instead of hanging.
+      let firstTaskResolved = false;
+      capturedTasks[0]().then(() => {
+        firstTaskResolved = true;
+      });
+      await Promise.resolve();
+      expect(firstTaskResolved).toBe(true);
+    });
   });
 });
 ```
@@ -1085,6 +1127,7 @@ export class LocationTrackingService {
   private readonly stateMachine = new TrackingStateMachine();
   private watchId: number | null = null;
   private sequence = 0;
+  private backgroundKeepAliveActive = false;
   private releaseBackgroundTask: (() => void) | null = null;
 
   constructor(
@@ -1155,16 +1198,27 @@ export class LocationTrackingService {
   }
 
   private startBackgroundKeepAlive(): void {
-    if (this.releaseBackgroundTask) {
-      return; // already running
+    if (this.backgroundKeepAliveActive) {
+      return; // already running — set synchronously below, so this can
+      // never be fooled by how late the native side gets around to
+      // actually invoking the task callback (see the design note).
     }
+    this.backgroundKeepAliveActive = true;
+
     // BackgroundActions treats a resolved task promise as "the task is
     // done" and immediately tears the foreground service down — so this
     // promise must stay pending until stopBackgroundKeepAlive() releases
-    // it, never resolve on its own.
+    // it, never resolve on its own. Exception: if we've already been
+    // stopped/paused again by the time the native side finally invokes
+    // this callback, resolve immediately instead of parking a resolver
+    // nothing will ever call.
     BackgroundActions.start(
       () =>
         new Promise<void>((resolve) => {
+          if (!this.backgroundKeepAliveActive) {
+            resolve();
+            return;
+          }
           this.releaseBackgroundTask = resolve;
         }),
       BACKGROUND_TASK_OPTIONS,
@@ -1177,6 +1231,7 @@ export class LocationTrackingService {
     if (Platform.OS !== 'android') {
       return;
     }
+    this.backgroundKeepAliveActive = false;
     this.releaseBackgroundTask?.();
     this.releaseBackgroundTask = null;
     BackgroundActions.stop().catch((error: unknown) => {
@@ -1191,6 +1246,8 @@ Add the dependency: `npm install react-native-geolocation-service react-native-b
 **Design note (from Task 5's review):** an earlier version of this class started `Geolocation.watchPosition` *inside* the callback passed to `BackgroundActions.start(async () => watch(), ...)`. Two problems followed from that. First, `async () => watch()` resolves on the very next tick (`watch()` is synchronous), and the `react-native-background-actions` library treats a resolved task as "finished" — it immediately tore the foreground service down again, so background tracking never actually survived the app being backgrounded on Android. Second, because the real library only invokes that callback once the native side has actually started the foreground service (a later tick, not synchronous with `start()` returning), `watchId` could still be `null` when `pause()`/`stop()` ran right after `start()`, silently skipping `clearWatch` and leaking a live GPS subscription that kept feeding route points after the service reported itself paused or stopped.
 
 The fix above separates the two jobs the old code conflated: `watchPosition` is now called synchronously in `beginWatching()` itself, independent of any background-task machinery, so `watchId` is always set before `start()`/`resume()` return. `BackgroundActions.start()` is now used purely to hold a promise open (via `startBackgroundKeepAlive()`/`stopBackgroundKeepAlive()`) so Android doesn't suspend the process while backgrounded — it never gates whether GPS watching happens. `pause()` now also releases that keep-alive task (mirroring `stop()`), and `resume()` restarts it via `beginWatching()`. An `onError` callback was added to the constructor so geolocation and background-service failures are actually observable instead of being silently swallowed, and the two `BackgroundActions` calls are `.catch()`-handled so a native failure becomes a callback invocation, not an unhandled promise rejection.
+
+**Second design note (from re-review after the first fix):** the first fix above still had one hole: `startBackgroundKeepAlive()`'s "already running" guard originally checked `releaseBackgroundTask`, which the real library only assigns once the native side actually invokes the task callback — a later, unpredictable tick, not synchronous with `BackgroundActions.start()` being called. A quick `pause()` immediately followed by `resume()` could run entirely before that native callback ever fired; when it finally did fire (against the now-resumed service), it would assign `releaseBackgroundTask` on a session `resume()` had already moved past, and the *next* `startBackgroundKeepAlive()` call would see that stale non-null value and silently skip starting a new native task — permanently losing the foreground service for the rest of that run, with no error and no visible symptom until Android killed the backgrounded app. The fix replaces that guard with `backgroundKeepAliveActive`, a plain boolean set synchronously the instant `startBackgroundKeepAlive()` runs (not dependent on native timing at all), and has the task callback itself check that flag when it does eventually fire: if we've already moved on, it resolves itself immediately instead of parking a resolver nothing will ever call again.
 
 Add to `android/app/src/main/AndroidManifest.xml`, inside `<manifest>` and `<application>` respectively:
 
