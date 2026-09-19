@@ -127,7 +127,7 @@ describe('LocationTrackingService', () => {
       expect(resolved).toBe(true);
     });
 
-    it('does not get stuck if pause()/resume() happen before the native side ever invokes the task callback', async () => {
+    it('does not touch the background keep-alive task across a pause()/resume() cycle', () => {
       jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
         OS: 'android',
         select: (obj: any) => obj.android,
@@ -136,16 +136,8 @@ describe('LocationTrackingService', () => {
         watchPosition: jest.fn().mockReturnValue(1),
         clearWatch: jest.fn(),
       }));
-
-      const capturedTasks: Array<() => Promise<void>> = [];
       jest.doMock('react-native-background-actions', () => ({
-        // Simulate real Android timing: start()'s own promise resolves
-        // right away, but the task it registers is only invoked later,
-        // by the native side — not synchronously here.
-        start: jest.fn().mockImplementation((task: () => Promise<void>) => {
-          capturedTasks.push(task);
-          return Promise.resolve();
-        }),
+        start: jest.fn().mockResolvedValue(undefined),
         stop: jest.fn().mockResolvedValue(undefined),
       }));
 
@@ -153,20 +145,23 @@ describe('LocationTrackingService', () => {
       const { LocationTrackingService: AndroidLocationTrackingService } = require('./locationTrackingService');
       const service = new AndroidLocationTrackingService(jest.fn());
 
-      service.start(); // registers task #1; native hasn't invoked it yet
-      service.pause(); // pauses before native ever gets to it
-      service.resume(); // must register a fresh task, not be blocked by a stale guard
+      service.start();
+      expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(1);
 
-      expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(2);
+      service.pause();
+      service.resume();
 
-      // Now let the native side finally get around to invoking the first
-      // (stale) task — it must resolve on its own instead of hanging.
-      let firstTaskResolved = false;
-      capturedTasks[0]().then(() => {
-        firstTaskResolved = true;
-      });
-      await Promise.resolve();
-      expect(firstTaskResolved).toBe(true);
+      // Pausing/resuming only toggles GPS watching, not the native
+      // background task — deliberately: the installed library ties
+      // resolving a task's promise directly to tearing down the *whole*
+      // foreground service, so there is no safe way to "restart" it
+      // mid-activity. See the design notes below this class for the two
+      // approaches that were tried and abandoned before landing here.
+      expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(1);
+      expect(AndroidBackgroundActions.stop).not.toHaveBeenCalled();
+
+      service.stop();
+      expect(AndroidBackgroundActions.stop).toHaveBeenCalledTimes(1);
     });
   });
 });
