@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+android/app/build/
+android/build/
+ios/build/
+ios/Pods/
+
+# Env
+.env
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+
+# Superpowers scratch (progress ledger, subagent diffs) — never commit
+.superpowers/
