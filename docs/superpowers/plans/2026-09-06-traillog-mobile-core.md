@@ -658,7 +658,7 @@ git commit -m "feat: add PermissionsManager normalizing platform permission stat
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `detectSteps(samples: AccelerometerSample[]): number` (pure function, reused as-is by Task 6's tracking store to compute step counts from buffered samples) and `PedometerService.start(onStepCountChange)/stop()`.
+- Produces: `detectSteps(samples: AccelerometerSample[]): number` (pure batch function, covered by this task's own tests) and `PedometerService.start(onStepCountChange)/stop()` — Task 6's tracking store consumes only the latter, treating it as an opaque service and never calling `detectSteps` directly.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -725,24 +725,51 @@ const GRAVITY = 9.8;
 const PEAK_THRESHOLD = 2.0; // magnitude delta from gravity that counts as a step peak
 const MIN_STEP_INTERVAL_MS = 250; // debounce: no human takes two steps faster than this
 
-export function detectSteps(samples: AccelerometerSample[]): number {
-  let steps = 0;
-  let lastPeakTimestamp = -Infinity;
-  let wasAboveThreshold = false;
+/**
+ * Carries peak-detection state across calls so steps can be counted
+ * incrementally, one sample at a time, without losing state at a
+ * buffer/window boundary. `detectSteps` below uses a fresh accumulator
+ * internally for one-shot batch counting; `PedometerService` (this file's
+ * sibling) keeps one accumulator alive for an entire tracking session so
+ * the count only ever goes up, instead of re-deriving a bounded count from
+ * a sliding window on every sample.
+ */
+export class StepAccumulator {
+  private lastPeakTimestamp = -Infinity;
+  private wasAboveThreshold = false;
+  private steps = 0;
 
-  for (const sample of samples) {
+  get stepCount(): number {
+    return this.steps;
+  }
+
+  /** Returns true if this sample was just counted as a new step. */
+  addSample(sample: AccelerometerSample): boolean {
     const magnitude = Math.sqrt(sample.x ** 2 + sample.y ** 2 + sample.z ** 2);
     const delta = magnitude - GRAVITY;
     const isAboveThreshold = delta > PEAK_THRESHOLD;
 
-    if (isAboveThreshold && !wasAboveThreshold && sample.timestamp - lastPeakTimestamp >= MIN_STEP_INTERVAL_MS) {
-      steps += 1;
-      lastPeakTimestamp = sample.timestamp;
+    let countedStep = false;
+    if (
+      isAboveThreshold &&
+      !this.wasAboveThreshold &&
+      sample.timestamp - this.lastPeakTimestamp >= MIN_STEP_INTERVAL_MS
+    ) {
+      this.steps += 1;
+      this.lastPeakTimestamp = sample.timestamp;
+      countedStep = true;
     }
-    wasAboveThreshold = isAboveThreshold;
+    this.wasAboveThreshold = isAboveThreshold;
+    return countedStep;
   }
+}
 
-  return steps;
+export function detectSteps(samples: AccelerometerSample[]): number {
+  const accumulator = new StepAccumulator();
+  for (const sample of samples) {
+    accumulator.addSample(sample);
+  }
+  return accumulator.stepCount;
 }
 ```
 
@@ -750,26 +777,23 @@ export function detectSteps(samples: AccelerometerSample[]): number {
 // src/sensors/pedometerService.ts
 import { accelerometer, setUpdateIntervalForType, SensorTypes } from 'react-native-sensors';
 import { Subscription } from 'rxjs';
-import { AccelerometerSample, detectSteps } from './stepDetector';
+import { StepAccumulator } from './stepDetector';
 
 setUpdateIntervalForType(SensorTypes.accelerometer, 20);
 
 export class PedometerService {
   private subscription: Subscription | null = null;
-  private buffer: AccelerometerSample[] = [];
-  private stepCount = 0;
+  private accumulator = new StepAccumulator();
 
   start(onStepCountChange: (count: number) => void): void {
-    this.buffer = [];
-    this.stepCount = 0;
+    if (this.subscription) {
+      return; // already running; avoid leaking a second subscription
+    }
+    this.accumulator = new StepAccumulator();
     this.subscription = accelerometer.subscribe(({ x, y, z, timestamp }) => {
-      this.buffer.push({ x, y, z, timestamp });
-      // Re-run detection on a rolling window so a step spanning the buffer boundary isn't missed.
-      const recentWindow = this.buffer.slice(-50);
-      const newCount = detectSteps(recentWindow);
-      if (newCount !== this.stepCount) {
-        this.stepCount = newCount;
-        onStepCountChange(this.stepCount);
+      const countedStep = this.accumulator.addSample({ x, y, z, timestamp });
+      if (countedStep) {
+        onStepCountChange(this.accumulator.stepCount);
       }
     });
   }
@@ -782,6 +806,8 @@ export class PedometerService {
 ```
 
 Add the dependency: `npm install react-native-sensors`.
+
+**Design note (from Task 4's review):** an earlier version of `PedometerService` re-ran `detectSteps` over only the last 50 buffered samples (~1 second) on every new reading and treated that as the running total. Since old peaks age out of that window, the count would plateau or even decrease during a real walk instead of accumulating — it never worked as an actual pedometer. The `StepAccumulator` class above fixes this by carrying peak-detection state for the service's entire lifetime, incrementing a monotonic count on each genuinely new peak, and is also used inside `detectSteps` itself so the two never drift apart. This also removes the unbounded `buffer` array the old version grew forever, and guards `start()` against being called twice without an intervening `stop()`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
