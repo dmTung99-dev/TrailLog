@@ -19,6 +19,6 @@ module.exports = {
   setupFilesAfterEnv: [],
   testEnvironment: 'node',
   transformIgnorePatterns: [
-    'node_modules/(?!(react-native|@react-native|@react-navigation|@react-native-community|react-native-get-random-values|react-native-permissions|uuid)/)',
+    'node_modules/(?!(react-native|@react-native|@react-native-async-storage|@react-navigation|@react-native-community|react-native-get-random-values|react-native-permissions|uuid)/)',
   ],
 };
