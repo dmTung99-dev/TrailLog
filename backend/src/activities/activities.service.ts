@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateActivityDto } from './dto/create-activity.dto';
+import { UpdateActivityDto } from './dto/update-activity.dto';
 
 @Injectable()
 export class ActivitiesService {
@@ -36,5 +37,30 @@ export class ActivitiesService {
       throw new NotFoundException('Activity not found');
     }
     return activity;
+  }
+
+  async updateMetadata(userId: string, activityId: string, dto: UpdateActivityDto) {
+    const current = await this.prisma.activity.findFirst({
+      where: { id: activityId, userId },
+    });
+    if (!current) {
+      throw new NotFoundException('Activity not found');
+    }
+
+    const clientSawAt = new Date(dto.clientUpdatedAt);
+    if (current.updatedAt.getTime() > clientSawAt.getTime()) {
+      return { status: 'conflict' as const, serverActivity: current };
+    }
+
+    const updated = await this.prisma.activity.update({
+      where: { id: activityId },
+      data: {
+        ...(dto.title !== undefined && { title: dto.title }),
+        ...(dto.notes !== undefined && { notes: dto.notes }),
+        ...(dto.visibility !== undefined && { visibility: dto.visibility }),
+      },
+    });
+
+    return { status: 'updated' as const, activity: updated };
   }
 }
