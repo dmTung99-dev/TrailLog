@@ -59,10 +59,10 @@ export class LocationTrackingService {
     this.beginWatching();
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.stateMachine.transition('STOP');
     this.stopWatching();
-    this.stopBackgroundKeepAlive();
+    await this.stopBackgroundKeepAlive();
   }
 
   private beginWatching(): void {
@@ -109,14 +109,16 @@ export class LocationTrackingService {
     });
   }
 
-  private stopBackgroundKeepAlive(): void {
+  private async stopBackgroundKeepAlive(): Promise<void> {
     if (Platform.OS !== 'android') {
       return;
     }
     this.releaseBackgroundTask?.();
     this.releaseBackgroundTask = null;
-    BackgroundActions.stop().catch((error: unknown) => {
+    try {
+      await BackgroundActions.stop();
+    } catch (error: unknown) {
       this.reportError(error);
-    });
+    }
   }
 }

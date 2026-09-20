@@ -122,12 +122,11 @@ describe('LocationTrackingService', () => {
       // and tears the foreground service down right away.
       expect(resolved).toBe(false);
 
-      service.stop();
-      await Promise.resolve();
+      await service.stop();
       expect(resolved).toBe(true);
     });
 
-    it('does not touch the background keep-alive task across a pause()/resume() cycle', () => {
+    it('does not touch the background keep-alive task across a pause()/resume() cycle', async () => {
       jest.doMock('react-native/Libraries/Utilities/Platform', () => ({
         OS: 'android',
         select: (obj: any) => obj.android,
@@ -160,7 +159,7 @@ describe('LocationTrackingService', () => {
       expect(AndroidBackgroundActions.start).toHaveBeenCalledTimes(1);
       expect(AndroidBackgroundActions.stop).not.toHaveBeenCalled();
 
-      service.stop();
+      await service.stop();
       expect(AndroidBackgroundActions.stop).toHaveBeenCalledTimes(1);
     });
   });
