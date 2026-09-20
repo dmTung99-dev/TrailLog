@@ -1287,14 +1287,14 @@ git commit -m "feat: add background-capable LocationTrackingService with a pure 
 
 **Interfaces:**
 - Consumes: `ActivitiesRepository` (Task 2), `LocationTrackingService` (Task 5), `PedometerService` (Task 4), `requestLocationPermission`/`requestCameraPermission` (Task 3).
-- Produces: `useTrackingStore` — `status`, `distanceMeters`, `stepCount`, `checkpointCount`, actions `startActivity()/pauseActivity()/resumeActivity()/stopActivity()/captureCheckpoint()` — the shape screens in Task 7 also read from for the just-finished activity's id.
+- Produces: `useTrackingStore` — `status`, `activityId`, `stepCount`, `checkpointCount`, `routePoints`, actions `startActivity()/pauseActivity()/resumeActivity()/stopActivity()/captureCheckpoint(photoPath)` — the shape screens in Task 7 also read from for the just-finished activity's id. `captureCheckpoint` takes only a photo path; the checkpoint's position comes from the store's own last-known GPS fix, not from the caller, since the screen has no independent way to know the current position.
 
 - [ ] **Step 1: Write the failing store test**
 
 ```typescript
 // src/store/trackingStore.test.ts
 import { useTrackingStore } from './trackingStore';
-import { createActivitiesRepository } from '../db/activitiesRepository';
+import { ActivitiesRepository, createActivitiesRepository } from '../db/activitiesRepository';
 import { createBetterSqliteAdapter } from '../../test/support/betterSqliteAdapter';
 import { initSchema } from '../db/schema';
 
@@ -1317,10 +1317,13 @@ jest.mock('../sensors/pedometerService', () => ({
 }));
 
 describe('useTrackingStore', () => {
+  let repo: ActivitiesRepository;
+
   beforeEach(async () => {
     const db = createBetterSqliteAdapter();
     await initSchema(db);
-    useTrackingStore.getState().__setRepositoryForTest(createActivitiesRepository(db));
+    repo = createActivitiesRepository(db);
+    useTrackingStore.getState().__setRepositoryForTest(repo);
   });
 
   it('starts an activity and reflects the first route point and step count', async () => {
@@ -1330,6 +1333,7 @@ describe('useTrackingStore', () => {
     expect(state.status).toBe('recording');
     expect(state.stepCount).toBe(5);
     expect(state.activityId).not.toBeNull();
+    expect(state.routePoints).toHaveLength(1);
   });
 
   it('stops the activity and resets to idle', async () => {
@@ -1337,6 +1341,32 @@ describe('useTrackingStore', () => {
     await useTrackingStore.getState().stopActivity();
 
     expect(useTrackingStore.getState().status).toBe('stopped');
+  });
+
+  it('ignores a second startActivity() call that fires before the first one finishes setting up', async () => {
+    // Both calls read `starting`/`status` before either has awaited
+    // anything — this is exactly the race a fast double-tap on Start can
+    // trigger, and it must not construct two LocationTrackingService
+    // instances against the same native background-task singleton (see
+    // Task 5's review history).
+    const first = useTrackingStore.getState().startActivity();
+    const second = useTrackingStore.getState().startActivity();
+    await Promise.all([first, second]);
+
+    const activities = await repo.listActivities();
+    expect(activities).toHaveLength(1);
+  });
+
+  it('captures a checkpoint at the last known position and attaches a photo path', async () => {
+    await useTrackingStore.getState().startActivity();
+    await useTrackingStore.getState().captureCheckpoint('/tmp/checkpoint.jpg');
+
+    const { activityId, checkpointCount } = useTrackingStore.getState();
+    expect(checkpointCount).toBe(1);
+
+    const activity = await repo.getActivity(activityId!);
+    expect(activity?.checkpoints).toHaveLength(1);
+    expect(activity?.checkpoints[0]).toMatchObject({ lat: 10.1, lng: 106.1, photoPath: '/tmp/checkpoint.jpg' });
   });
 });
 ```
@@ -1351,7 +1381,7 @@ Expected: FAIL — `Cannot find module './trackingStore'`.
 ```typescript
 // src/store/trackingStore.ts
 import { create } from 'zustand';
-import { ActivitiesRepository, createActivitiesRepository, CheckpointInput } from '../db/activitiesRepository';
+import { ActivitiesRepository, createActivitiesRepository, RoutePointInput } from '../db/activitiesRepository';
 import { createSqliteStorageAdapter } from '../db/sqliteStorageAdapter';
 import { LocationTrackingService } from '../tracking/locationTrackingService';
 import { PedometerService } from '../sensors/pedometerService';
@@ -1361,11 +1391,12 @@ interface TrackingStoreState {
   activityId: string | null;
   stepCount: number;
   checkpointCount: number;
+  routePoints: RoutePointInput[];
   startActivity: () => Promise<void>;
   pauseActivity: () => void;
   resumeActivity: () => void;
   stopActivity: () => Promise<void>;
-  captureCheckpoint: (input: CheckpointInput) => Promise<void>;
+  captureCheckpoint: (photoPath: string) => Promise<void>;
   __setRepositoryForTest: (repo: ActivitiesRepository) => void;
 }
 
@@ -1383,25 +1414,50 @@ async function getRepository(): Promise<ActivitiesRepository> {
 export const useTrackingStore = create<TrackingStoreState>((set, get) => {
   let locationService: LocationTrackingService | null = null;
   let pedometerService: PedometerService | null = null;
+  let lastKnownPosition: { lat: number; lng: number } | null = null;
+  let starting = false;
 
   return {
     status: 'idle',
     activityId: null,
     stepCount: 0,
     checkpointCount: 0,
+    routePoints: [],
 
     async startActivity() {
-      const repo = await getRepository();
-      const activityId = await repo.createActivity({ title: 'Untitled activity', startedAt: new Date().toISOString() });
-      set({ activityId, status: 'recording', stepCount: 0, checkpointCount: 0 });
+      // `starting` is set synchronously, before any `await` below — a
+      // second call arriving while this one is still setting up (a fast
+      // double-tap on Start, mid-way through opening the SQLite
+      // connection) must not fall through and construct a second
+      // LocationTrackingService against the same native background-task
+      // singleton (see Task 5's review history: that library has no
+      // per-instance isolation).
+      if (starting || (locationService !== null && get().status !== 'stopped')) {
+        return;
+      }
+      starting = true;
 
-      locationService = new LocationTrackingService((point) => {
-        repo.addRoutePoint(activityId, point);
-      });
-      locationService.start();
+      try {
+        const repo = await getRepository();
+        const activityId = await repo.createActivity({
+          title: 'Untitled activity',
+          startedAt: new Date().toISOString(),
+        });
+        set({ activityId, status: 'recording', stepCount: 0, checkpointCount: 0, routePoints: [] });
+        lastKnownPosition = null;
 
-      pedometerService = new PedometerService();
-      pedometerService.start((count) => set({ stepCount: count }));
+        locationService = new LocationTrackingService((point) => {
+          repo.addRoutePoint(activityId, point);
+          lastKnownPosition = { lat: point.lat, lng: point.lng };
+          set((state) => ({ routePoints: [...state.routePoints, point] }));
+        });
+        locationService.start();
+
+        pedometerService = new PedometerService();
+        pedometerService.start((count) => set({ stepCount: count }));
+      } finally {
+        starting = false;
+      }
     },
 
     pauseActivity() {
@@ -1420,11 +1476,16 @@ export const useTrackingStore = create<TrackingStoreState>((set, get) => {
       set({ status: 'stopped' });
     },
 
-    async captureCheckpoint(input) {
+    async captureCheckpoint(photoPath) {
       const { activityId, checkpointCount } = get();
-      if (!activityId) return;
+      if (!activityId || !lastKnownPosition) return;
       const repo = await getRepository();
-      await repo.addCheckpoint(activityId, input);
+      const checkpointId = await repo.addCheckpoint(activityId, {
+        lat: lastKnownPosition.lat,
+        lng: lastKnownPosition.lng,
+        capturedAt: new Date().toISOString(),
+      });
+      await repo.setCheckpointPhotoPath(checkpointId, photoPath);
       set({ checkpointCount: checkpointCount + 1 });
     },
 
@@ -1438,18 +1499,20 @@ export const useTrackingStore = create<TrackingStoreState>((set, get) => {
 - [ ] **Step 4: Run the store test to verify it passes**
 
 Run: `npx jest trackingStore`
-Expected: PASS — both cases green.
+Expected: PASS — all four cases green.
 
 - [ ] **Step 5: Write the failing screen component test**
 
 ```tsx
 // src/screens/TrackingScreen.test.tsx
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react-native';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react-native';
 import { TrackingScreen } from './TrackingScreen';
 import { useTrackingStore } from '../store/trackingStore';
+import { capturePhoto } from '../camera/cameraService';
 
 jest.mock('../store/trackingStore');
+jest.mock('../camera/cameraService');
 
 describe('TrackingScreen', () => {
   it('shows an idle Start button and calls startActivity when pressed', () => {
@@ -1458,10 +1521,12 @@ describe('TrackingScreen', () => {
       status: 'idle',
       stepCount: 0,
       checkpointCount: 0,
+      routePoints: [],
       startActivity,
       pauseActivity: jest.fn(),
       resumeActivity: jest.fn(),
       stopActivity: jest.fn(),
+      captureCheckpoint: jest.fn(),
     });
 
     render(<TrackingScreen />);
@@ -1474,14 +1539,37 @@ describe('TrackingScreen', () => {
       status: 'recording',
       stepCount: 42,
       checkpointCount: 1,
+      routePoints: [],
       startActivity: jest.fn(),
       pauseActivity: jest.fn(),
       resumeActivity: jest.fn(),
       stopActivity: jest.fn(),
+      captureCheckpoint: jest.fn(),
     });
 
     render(<TrackingScreen />);
     expect(screen.getByText('Steps: 42')).toBeTruthy();
+  });
+
+  it('captures a photo and records a checkpoint when "Capture checkpoint" is pressed', async () => {
+    const captureCheckpoint = jest.fn();
+    (capturePhoto as jest.Mock).mockResolvedValue({ path: '/tmp/checkpoint.jpg' });
+    (useTrackingStore as unknown as jest.Mock).mockReturnValue({
+      status: 'recording',
+      stepCount: 10,
+      checkpointCount: 0,
+      routePoints: [],
+      startActivity: jest.fn(),
+      pauseActivity: jest.fn(),
+      resumeActivity: jest.fn(),
+      stopActivity: jest.fn(),
+      captureCheckpoint,
+    });
+
+    render(<TrackingScreen />);
+    fireEvent.press(screen.getByText('Capture checkpoint'));
+
+    await waitFor(() => expect(captureCheckpoint).toHaveBeenCalledWith('/tmp/checkpoint.jpg'));
   });
 });
 ```
@@ -1491,45 +1579,7 @@ describe('TrackingScreen', () => {
 Run: `npx jest TrackingScreen`
 Expected: FAIL — `Cannot find module './TrackingScreen'`.
 
-- [ ] **Step 7: Implement the screen**
-
-```tsx
-// src/screens/TrackingScreen.tsx
-import React from 'react';
-import { Button, StyleSheet, Text, View } from 'react-native';
-import { useTrackingStore } from '../store/trackingStore';
-
-export function TrackingScreen() {
-  const { status, stepCount, checkpointCount, startActivity, pauseActivity, resumeActivity, stopActivity } =
-    useTrackingStore();
-
-  return (
-    <View style={styles.container}>
-      <Text style={styles.stat}>Steps: {stepCount}</Text>
-      <Text style={styles.stat}>Checkpoints: {checkpointCount}</Text>
-
-      {status === 'idle' && <Button title="Start" onPress={startActivity} />}
-      {status === 'recording' && (
-        <>
-          <Button title="Pause" onPress={pauseActivity} />
-          <Button title="Stop" onPress={stopActivity} />
-        </>
-      )}
-      {status === 'paused' && (
-        <>
-          <Button title="Resume" onPress={resumeActivity} />
-          <Button title="Stop" onPress={stopActivity} />
-        </>
-      )}
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
-  stat: { fontSize: 18 },
-});
-```
+- [ ] **Step 7: Implement the screen, camera service, and their native-module mocks**
 
 ```typescript
 // src/camera/cameraService.ts
@@ -1546,6 +1596,85 @@ export async function capturePhoto(camera: Camera): Promise<CapturedPhoto> {
 ```
 
 ```tsx
+// src/screens/TrackingScreen.tsx
+import React, { useRef } from 'react';
+import { Button, StyleSheet, Text, View } from 'react-native';
+import { Camera, useCameraDevice } from 'react-native-vision-camera';
+import MapView, { Polyline } from 'react-native-maps';
+import { useTrackingStore } from '../store/trackingStore';
+import { capturePhoto } from '../camera/cameraService';
+
+export function TrackingScreen() {
+  const {
+    status,
+    stepCount,
+    checkpointCount,
+    routePoints,
+    startActivity,
+    pauseActivity,
+    resumeActivity,
+    stopActivity,
+    captureCheckpoint,
+  } = useTrackingStore();
+  const cameraRef = useRef<Camera>(null);
+  const device = useCameraDevice('back');
+
+  const onCapturePress = async () => {
+    if (!cameraRef.current) return;
+    const photo = await capturePhoto(cameraRef.current);
+    await captureCheckpoint(photo.path);
+  };
+
+  return (
+    <View style={styles.container}>
+      {routePoints.length > 0 && (
+        <MapView
+          style={styles.map}
+          initialRegion={{
+            latitude: routePoints[0].lat,
+            longitude: routePoints[0].lng,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          }}
+        >
+          <Polyline coordinates={routePoints.map((p) => ({ latitude: p.lat, longitude: p.lng }))} />
+        </MapView>
+      )}
+
+      <Text style={styles.stat}>Steps: {stepCount}</Text>
+      <Text style={styles.stat}>Checkpoints: {checkpointCount}</Text>
+
+      {status === 'idle' && <Button title="Start" onPress={startActivity} />}
+      {status === 'recording' && (
+        <>
+          <Button title="Pause" onPress={pauseActivity} />
+          <Button title="Capture checkpoint" onPress={onCapturePress} />
+          <Button title="Stop" onPress={stopActivity} />
+        </>
+      )}
+      {status === 'paused' && (
+        <>
+          <Button title="Resume" onPress={resumeActivity} />
+          <Button title="Stop" onPress={stopActivity} />
+        </>
+      )}
+
+      {status === 'recording' && device && (
+        <Camera ref={cameraRef} style={styles.hiddenCamera} device={device} photo isActive />
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
+  map: { width: '100%', height: 200 },
+  stat: { fontSize: 18 },
+  hiddenCamera: { width: 1, height: 1, opacity: 0 },
+});
+```
+
+```tsx
 // App.tsx (add the Tracking route)
 import { TrackingScreen } from './src/screens/TrackingScreen';
 // ...inside Stack.Navigator, after the Home screen:
@@ -1554,16 +1683,61 @@ import { TrackingScreen } from './src/screens/TrackingScreen';
 
 Add the dependency: `npm install react-native-vision-camera react-native-maps`.
 
+`react-native-vision-camera` and `react-native-maps` are native modules — importing them (even just for their type/component exports) crashes under Jest outside a real native runtime, exactly like `react-native-geolocation-service`/`react-native-background-actions`/`react-native-sensors` did in earlier tasks. Add manual mocks following the same convention already established in this codebase (a `src/__mocks__/<package>.js` file wired through `jest.config.js`'s `moduleNameMapper`):
+
+```javascript
+// src/__mocks__/react-native-vision-camera.js
+const React = require('react');
+
+const Camera = React.forwardRef((_props, ref) => {
+  React.useImperativeHandle(ref, () => ({
+    takePhoto: jest.fn().mockResolvedValue({ path: '/mock/photo.jpg' }),
+  }));
+  return null;
+});
+
+module.exports = {
+  Camera,
+  useCameraDevice: jest.fn(() => ({ id: 'mock-camera-device' })),
+};
+```
+
+```javascript
+// src/__mocks__/react-native-maps.js
+const React = require('react');
+
+function MapView(props) {
+  return React.createElement('MapView', props, props.children);
+}
+
+function Polyline(props) {
+  return React.createElement('Polyline', props);
+}
+
+module.exports = {
+  __esModule: true,
+  default: MapView,
+  Polyline,
+};
+```
+
+Add both to `jest.config.js`'s existing `moduleNameMapper` block (the same object that already maps `react-native-geolocation-service`, `react-native-background-actions`, and `react-native-sensors` from Task 6's earlier steps and `react-native-permissions` from Task 3):
+
+```javascript
+'^react-native-vision-camera$': '<rootDir>/src/__mocks__/react-native-vision-camera.js',
+'^react-native-maps$': '<rootDir>/src/__mocks__/react-native-maps.js',
+```
+
 - [ ] **Step 8: Run the test to verify it passes**
 
 Run: `npx jest TrackingScreen`
-Expected: PASS — both cases green.
+Expected: PASS — all three cases green.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/store src/camera src/screens/TrackingScreen.tsx App.tsx package.json
-git commit -m "feat: add tracking screen wiring location, pedometer, and local storage together"
+git add src/store src/camera src/screens/TrackingScreen.tsx src/__mocks__ App.tsx jest.config.js package.json
+git commit -m "feat: wire camera checkpoint capture and a live route map into the tracking screen"
 ```
 
 ---
