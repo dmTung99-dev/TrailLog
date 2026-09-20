@@ -26,7 +26,15 @@ export function ConflictResolutionScreen({ route }: Props) {
   const keepMine = async () => {
     const db = await createSqliteStorageAdapter();
     const repo = createActivitiesRepository(db);
-    await repo.markActivitySynced(activity.id, serverActivity.id, serverActivity.updatedAt);
+    // Deliberately does NOT call markActivitySynced or the API client
+    // directly — that would duplicate SyncEngine's already-hardened
+    // conflict-push logic. Re-applying the activity's own current title
+    // touches updated_at (to now, newer than the server's stored
+    // updatedAt from the conflict) and resets sync_status to 'pending',
+    // so the next real syncNow() pass pushes this activity's title
+    // through the normal, well-tested path instead of just recording a
+    // local-only "resolved" flag that the server never sees.
+    await repo.updateActivityMetadata(activity.id, { title: activity.title });
   };
 
   const takeServerVersion = async () => {

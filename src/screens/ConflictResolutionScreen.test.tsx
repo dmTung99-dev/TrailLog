@@ -14,11 +14,9 @@ describe('ConflictResolutionScreen', () => {
 
   it('shows both versions and lets the user keep the local one', async () => {
     const updateActivityMetadata = jest.fn();
-    const markActivitySynced = jest.fn();
     jest.spyOn(repoModule, 'createActivitiesRepository').mockReturnValue({
       getActivity: jest.fn().mockResolvedValue(localActivity),
       updateActivityMetadata,
-      markActivitySynced,
     } as any);
 
     render(<ConflictResolutionScreen route={{ params: { activityId: 'local-1' } } as any} />);
@@ -28,7 +26,12 @@ describe('ConflictResolutionScreen', () => {
 
     fireEvent.press(screen.getByText('Keep mine'));
 
-    await waitFor(() => expect(markActivitySynced).toHaveBeenCalledWith('local-1', 'server-1', '2026-09-21T12:00:00.000Z'));
+    // Touches the activity's own title so updateActivityMetadata's real
+    // implementation resets updated_at/sync_status — proving this goes
+    // through the same path a genuine edit does (and from there through
+    // SyncEngine's already-hardened pushActivity), not a dead-end
+    // local-only write that never reaches the server.
+    await waitFor(() => expect(updateActivityMetadata).toHaveBeenCalledWith('local-1', { title: 'My renamed hike' }));
   });
 
   it('lets the user take the server version instead', async () => {
