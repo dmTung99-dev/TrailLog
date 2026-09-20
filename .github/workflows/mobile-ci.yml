@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -18,3 +19,16 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
+
+  e2e:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14 # includes the Android emulator/KVM support needed for Detox
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx detox build --configuration android.emu.debug
+      - run: npx detox test --configuration android.emu.debug

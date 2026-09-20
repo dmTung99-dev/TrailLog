@@ -1,5 +1,9 @@
 module.exports = {
   preset: 'react-native',
+  // e2e/ contains Detox specs that rely on Detox's own test runner and
+  // globals (device/by/element), configured separately via e2e/jest.config.js.
+  // They must not be picked up by the plain unit-test run.
+  testPathIgnorePatterns: ['/node_modules/', '<rootDir>/e2e/'],
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
     '^react-native-permissions$': '<rootDir>/src/__mocks__/react-native-permissions.js',
