@@ -4,6 +4,7 @@ import { ActivitiesRepository, createActivitiesRepository, RoutePointInput } fro
 import { createSqliteStorageAdapter } from '../db/sqliteStorageAdapter';
 import { LocationTrackingService } from '../tracking/locationTrackingService';
 import { PedometerService } from '../sensors/pedometerService';
+import { requestLocationPermission, requestMotionPermission } from '../permissions/permissionsManager';
 
 interface TrackingStoreState {
   status: 'idle' | 'recording' | 'paused' | 'stopped';
@@ -57,6 +58,14 @@ export const useTrackingStore = create<TrackingStoreState>((set, get) => {
       starting = true;
 
       try {
+        // The OS permission prompt must be answered before we touch
+        // location/camera/motion APIs at all. A denied/restricted result
+        // means we must not create an activity row or start any tracking.
+        const locationPermission = await requestLocationPermission();
+        if (locationPermission === 'denied' || locationPermission === 'restricted') {
+          return;
+        }
+
         const repo = await getRepository();
         const activityId = await repo.createActivity({
           title: 'Untitled activity',
@@ -72,6 +81,10 @@ export const useTrackingStore = create<TrackingStoreState>((set, get) => {
         });
         locationService.start();
 
+        // Motion permission is best-effort: whatever it resolves to, we
+        // still start the pedometer. A denial just means steps won't be
+        // counted, which is an acceptable degradation, not a hard failure.
+        await requestMotionPermission();
         pedometerService = new PedometerService();
         pedometerService.start((count) => set({ stepCount: count }));
       } finally {
@@ -90,7 +103,11 @@ export const useTrackingStore = create<TrackingStoreState>((set, get) => {
     },
 
     async stopActivity() {
-      locationService?.stop();
+      // Wait for the native background-task teardown to actually finish
+      // before flipping status to 'stopped' — otherwise a fast Stop-then-
+      // Start can call BackgroundActions.start() for a new task before the
+      // previous BackgroundActions.stop() has torn down the prior one.
+      await locationService?.stop();
       pedometerService?.stop();
       set({ status: 'stopped' });
     },

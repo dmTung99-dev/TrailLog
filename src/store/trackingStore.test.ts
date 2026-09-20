@@ -3,6 +3,7 @@ import { useTrackingStore } from './trackingStore';
 import { ActivitiesRepository, createActivitiesRepository } from '../db/activitiesRepository';
 import { createBetterSqliteAdapter } from '../../test/support/betterSqliteAdapter';
 import { initSchema } from '../db/schema';
+import { requestLocationPermission, requestMotionPermission } from '../permissions/permissionsManager';
 
 jest.mock('../tracking/locationTrackingService', () => {
   return {
@@ -10,7 +11,9 @@ jest.mock('../tracking/locationTrackingService', () => {
       start: () => onRoutePoint({ lat: 10.1, lng: 106.1, recordedAt: new Date().toISOString(), sequence: 0 }),
       pause: jest.fn(),
       resume: jest.fn(),
-      stop: jest.fn(),
+      // `trackingStore.stopActivity()` now awaits this — it must resolve,
+      // not just be a bare jest.fn(), or the store would hang.
+      stop: jest.fn().mockResolvedValue(undefined),
     })),
   };
 });
@@ -20,6 +23,11 @@ jest.mock('../sensors/pedometerService', () => ({
     start: (onChange: (count: number) => void) => onChange(5),
     stop: jest.fn(),
   })),
+}));
+
+jest.mock('../permissions/permissionsManager', () => ({
+  requestLocationPermission: jest.fn().mockResolvedValue('granted'),
+  requestMotionPermission: jest.fn().mockResolvedValue('granted'),
 }));
 
 describe('useTrackingStore', () => {
@@ -38,6 +46,8 @@ describe('useTrackingStore', () => {
     // the next test's startActivity() silently no-op via the re-entrancy
     // guard, leaving activityId pointing at the previous test's database.
     useTrackingStore.setState({ status: 'stopped', activityId: null, stepCount: 0, checkpointCount: 0, routePoints: [] });
+    (requestLocationPermission as jest.Mock).mockClear().mockResolvedValue('granted');
+    (requestMotionPermission as jest.Mock).mockClear().mockResolvedValue('granted');
   });
 
   it('starts an activity and reflects the first route point and step count', async () => {
@@ -48,6 +58,35 @@ describe('useTrackingStore', () => {
     expect(state.stepCount).toBe(5);
     expect(state.activityId).not.toBeNull();
     expect(state.routePoints).toHaveLength(1);
+  });
+
+  it('requests location permission before starting and does not create an activity when it is denied', async () => {
+    (requestLocationPermission as jest.Mock).mockResolvedValueOnce('denied');
+
+    await useTrackingStore.getState().startActivity();
+
+    expect(requestLocationPermission).toHaveBeenCalled();
+    expect(useTrackingStore.getState().activityId).toBeNull();
+    expect(useTrackingStore.getState().status).not.toBe('recording');
+    const activities = await repo.listActivities();
+    expect(activities).toHaveLength(0);
+  });
+
+  it('also does not create an activity when location permission is restricted', async () => {
+    (requestLocationPermission as jest.Mock).mockResolvedValueOnce('restricted');
+
+    await useTrackingStore.getState().startActivity();
+
+    expect(useTrackingStore.getState().activityId).toBeNull();
+    const activities = await repo.listActivities();
+    expect(activities).toHaveLength(0);
+  });
+
+  it('requests motion permission as part of starting, but still starts tracking when it resolves granted', async () => {
+    await useTrackingStore.getState().startActivity();
+
+    expect(requestMotionPermission).toHaveBeenCalled();
+    expect(useTrackingStore.getState().status).toBe('recording');
   });
 
   it('stops the activity and resets to idle', async () => {

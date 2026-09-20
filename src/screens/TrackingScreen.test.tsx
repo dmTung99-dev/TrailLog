@@ -3,11 +3,20 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react-nativ
 import { TrackingScreen } from './TrackingScreen';
 import { useTrackingStore } from '../store/trackingStore';
 import { capturePhoto } from '../camera/cameraService';
+import { requestCameraPermission } from '../permissions/permissionsManager';
 
 jest.mock('../store/trackingStore');
 jest.mock('../camera/cameraService');
+jest.mock('../permissions/permissionsManager', () => ({
+  requestCameraPermission: jest.fn().mockResolvedValue('granted'),
+}));
 
 describe('TrackingScreen', () => {
+  beforeEach(() => {
+    (requestCameraPermission as jest.Mock).mockClear().mockResolvedValue('granted');
+    (capturePhoto as jest.Mock).mockClear();
+  });
+
   it('shows an idle Start button and calls startActivity when pressed', () => {
     const startActivity = jest.fn();
     (useTrackingStore as unknown as jest.Mock).mockReturnValue({
@@ -63,5 +72,28 @@ describe('TrackingScreen', () => {
     fireEvent.press(screen.getByText('Capture checkpoint'));
 
     await waitFor(() => expect(captureCheckpoint).toHaveBeenCalledWith('/tmp/checkpoint.jpg'));
+  });
+
+  it('does not capture a photo or checkpoint when camera permission is denied', async () => {
+    (requestCameraPermission as jest.Mock).mockResolvedValueOnce('denied');
+    const captureCheckpoint = jest.fn();
+    (useTrackingStore as unknown as jest.Mock).mockReturnValue({
+      status: 'recording',
+      stepCount: 10,
+      checkpointCount: 0,
+      routePoints: [],
+      startActivity: jest.fn(),
+      pauseActivity: jest.fn(),
+      resumeActivity: jest.fn(),
+      stopActivity: jest.fn(),
+      captureCheckpoint,
+    });
+
+    render(<TrackingScreen />);
+    fireEvent.press(screen.getByText('Capture checkpoint'));
+
+    await waitFor(() => expect(requestCameraPermission).toHaveBeenCalled());
+    expect(capturePhoto).not.toHaveBeenCalled();
+    expect(captureCheckpoint).not.toHaveBeenCalled();
   });
 });

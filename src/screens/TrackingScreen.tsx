@@ -4,6 +4,7 @@ import { Camera, useCameraDevice } from 'react-native-vision-camera';
 import MapView, { Polyline } from 'react-native-maps';
 import { useTrackingStore } from '../store/trackingStore';
 import { capturePhoto } from '../camera/cameraService';
+import { requestCameraPermission } from '../permissions/permissionsManager';
 
 export function TrackingScreen() {
   const {
@@ -22,6 +23,8 @@ export function TrackingScreen() {
 
   const onCapturePress = async () => {
     if (!cameraRef.current) return;
+    const permission = await requestCameraPermission();
+    if (permission !== 'granted') return;
     const photo = await capturePhoto(cameraRef.current);
     await captureCheckpoint(photo.path);
   };
