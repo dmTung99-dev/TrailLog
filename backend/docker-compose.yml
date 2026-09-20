@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: traillog
+      POSTGRES_PASSWORD: traillog
+      POSTGRES_DB: traillog
+    ports:
+      - '5432:5432'
+    volumes:
+      - traillog-db:/var/lib/postgresql/data
+
+volumes:
+  traillog-db:
