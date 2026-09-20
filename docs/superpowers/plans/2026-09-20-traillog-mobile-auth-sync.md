@@ -1512,6 +1512,169 @@ git commit -m "fix: make conflicted activities discoverable and reachable from H
 
 ---
 
+### Task 7: Final-review fixes — "Keep mine" never syncs, and two HistoryScreen staleness/race gaps
+
+Added after the final whole-branch review found one Critical and two Important defects that task-scoped reviews' mocked-repository tests couldn't reach:
+
+1. **`ConflictResolutionScreen`'s `keepMine` never contacts the server.** It only calls `repo.markActivitySynced(...)` — a purely local write — which permanently sets `sync_status = 'synced'`, excluding the activity from every future `listPendingActivities()` call. The server keeps whichever edit caused the conflict, forever, with no error and no retry. This defeats the plan's own stated goal ("conflict surfaced to the user rather than silently discarded") for exactly the branch a user picks to assert their own edit wins.
+2. **`HistoryScreen` never refetches its activity list** after "Sync now" completes or after returning from `ConflictResolutionScreen` — a freshly-detected conflict or a freshly-completed sync is invisible in the per-row status/Resolve UI until the whole screen unmounts and remounts.
+3. **No guard against a double-tap on "Sync now"** — two overlapping `syncNow()` calls each take their own snapshot of pending activities before either writes back, so the same not-yet-synced activity can have `createActivity` called twice, producing a real duplicate on the backend.
+
+**Files:**
+- Modify: `src/screens/ConflictResolutionScreen.tsx` (fix `keepMine`)
+- Modify: `src/screens/HistoryScreen.tsx` (refetch on focus/after sync; disable "Sync now" while a sync is in flight)
+- Test: extend `src/screens/ConflictResolutionScreen.test.tsx` and `src/screens/HistoryScreen.test.tsx`
+
+**Interfaces:**
+- Consumes: `ActivitiesRepository.updateActivityMetadata` (already exists, from the mobile-core plan's Task 2 — deliberately reused rather than adding a new method or calling `apiClient` directly from the UI).
+- Produces: nothing new consumed elsewhere — this is the last task in this plan.
+
+- [ ] **Step 1: Fix `keepMine` — read the real current file first**
+
+The fix does **not** call `apiClient` directly from the screen (that would duplicate conflict-push logic `SyncEngine` already has, well-tested, in one place). Instead, it makes the SAME local edit `updateActivityMetadata` already makes for a genuine title/notes change — re-applying the activity's own current `title` as a "no-op" edit. `updateActivityMetadata` (Task 2 of the mobile-core plan, extended by Task 4 of this plan) always stamps `updated_at = now()` and `sync_status = 'pending'` when its `title` branch runs, *regardless* of whether the new value differs from the old one. That's exactly what "keep mine" needs: a fresh `updated_at` newer than the server's (so the next `syncNow()` doesn't immediately re-conflict) and `sync_status` back to `'pending'` (so that next pass actually happens), after which `SyncEngine`'s already-hardened `pushActivity` does the real network call.
+
+```tsx
+// src/screens/ConflictResolutionScreen.tsx — replace keepMine's body
+  const keepMine = async () => {
+    const db = await createSqliteStorageAdapter();
+    const repo = createActivitiesRepository(db);
+    // Deliberately does NOT call markActivitySynced or the API client
+    // directly — that would duplicate SyncEngine's already-hardened
+    // conflict-push logic. Re-applying the activity's own current title
+    // touches updated_at (to now, newer than the server's stored
+    // updatedAt from the conflict) and resets sync_status to 'pending',
+    // so the next real syncNow() pass pushes this activity's title
+    // through the normal, well-tested path instead of just recording a
+    // local-only "resolved" flag that the server never sees.
+    await repo.updateActivityMetadata(activity.id, { title: activity.title });
+  };
+```
+
+Update the test for this behavior:
+
+```tsx
+// src/screens/ConflictResolutionScreen.test.tsx — replace the "keeps mine" test's assertions
+  it('shows both versions and lets the user keep the local one', async () => {
+    const updateActivityMetadata = jest.fn();
+    jest.spyOn(repoModule, 'createActivitiesRepository').mockReturnValue({
+      getActivity: jest.fn().mockResolvedValue(localActivity),
+      updateActivityMetadata,
+    } as any);
+
+    render(<ConflictResolutionScreen route={{ params: { activityId: 'local-1' } } as any} />);
+
+    await waitFor(() => expect(screen.getByText('My renamed hike')).toBeTruthy());
+    expect(screen.getByText('Server renamed hike')).toBeTruthy();
+
+    fireEvent.press(screen.getByText('Keep mine'));
+
+    // Touches the activity's own title so updateActivityMetadata's real
+    // implementation resets updated_at/sync_status — proving this now
+    // goes through the same path a genuine edit does, not a dead-end
+    // local-only write.
+    await waitFor(() => expect(updateActivityMetadata).toHaveBeenCalledWith('local-1', { title: 'My renamed hike' }));
+  });
+```
+
+Remove the now-unused `markActivitySynced` mock from this test's setup if the file's real current fixture includes one solely for this test.
+
+- [ ] **Step 2: Run the test to verify it fails, then passes**
+
+Run: `npx jest ConflictResolutionScreen`
+Expected: FAIL before the fix (asserts a call that never happens), PASS after.
+
+- [ ] **Step 3: Fix `HistoryScreen`'s staleness and double-tap race — read the real current file first**
+
+Apply this against the file's actual current structure (it already has `activities`/`syncSummary` state, a `useNavigation` call, and an `onSyncPress` handler from Tasks 5/6 of this plan and Task 7 of the mobile-core plan) rather than replacing it wholesale:
+
+```tsx
+// src/screens/HistoryScreen.tsx — sketch of the required behavior; adapt to the real file
+import { useFocusEffect } from '@react-navigation/native';
+import { useCallback, useState } from 'react';
+// ...
+export function HistoryScreen() {
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [syncSummary, setSyncSummary] = useState<SyncSummary | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const navigation = useNavigation<any>();
+
+  const loadActivities = useCallback(async () => {
+    const db = await createSqliteStorageAdapter();
+    const repo = createActivitiesRepository(db);
+    setActivities(await repo.listActivities());
+  }, []);
+
+  // Refetches every time this screen becomes focused — covers both
+  // "returned from ConflictResolutionScreen after resolving" and the
+  // screen's own first mount, replacing a mount-only useEffect.
+  useFocusEffect(
+    useCallback(() => {
+      loadActivities();
+    }, [loadActivities]),
+  );
+
+  const onSyncPress = async () => {
+    if (isSyncing) {
+      return; // ignore a re-entrant press while a sync is already running
+    }
+    setIsSyncing(true);
+    try {
+      const db = await createSqliteStorageAdapter();
+      const repo = createActivitiesRepository(db);
+      const engine = createSyncEngine(repo, apiClient);
+      const summary = await engine.syncNow();
+      setSyncSummary(summary);
+      await loadActivities(); // reflect any newly-synced/conflicted rows immediately
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+  // ...
+  //   <Button title="Sync now" onPress={onSyncPress} disabled={isSyncing} />
+}
+```
+
+Add a test proving the double-tap guard specifically:
+
+```tsx
+// src/screens/HistoryScreen.test.tsx — add this case
+it('ignores a second "Sync now" press while a sync is already in flight', async () => {
+  jest.spyOn(repoModule, 'createActivitiesRepository').mockReturnValue({
+    listActivities: jest.fn().mockResolvedValue([]),
+  } as any);
+  let resolveSyncNow: (summary: SyncSummary) => void = () => {};
+  const syncNow = jest.fn().mockImplementation(
+    () => new Promise<SyncSummary>((resolve) => { resolveSyncNow = resolve; }),
+  );
+  jest.spyOn(syncEngineModule, 'createSyncEngine').mockReturnValue({ syncNow });
+
+  render(<HistoryScreen />);
+  fireEvent.press(screen.getByText('Sync now'));
+  fireEvent.press(screen.getByText('Sync now')); // second press while the first is still pending
+
+  resolveSyncNow({ synced: 1, conflicts: 0, failed: 0 });
+  await waitFor(() => expect(screen.getByText('Synced 1, 0 conflicts')).toBeTruthy());
+
+  expect(syncNow).toHaveBeenCalledTimes(1);
+});
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx jest HistoryScreen`
+Expected: PASS — the new double-tap case plus every pre-existing case green.
+
+- [ ] **Step 5: Verify and commit**
+
+Run `npm ci --no-audit --no-fund && npm run lint && npx tsc --noEmit && npx jest` from the repo root. All must pass with no regression.
+
+```bash
+git add src/screens/ConflictResolutionScreen.tsx src/screens/ConflictResolutionScreen.test.tsx src/screens/HistoryScreen.tsx src/screens/HistoryScreen.test.tsx
+git commit -m "fix: make 'keep mine' actually sync, and close two HistoryScreen staleness/race gaps"
+```
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage:** login/register with session persistence ✅ (Task 3), typed API client for every backend endpoint ✅ (Task 1), pushing pending activities/route points/checkpoints/photos ✅ (Task 4), conflict surfaced to the user rather than silently discarded ✅ (Task 5), local schema support for server-id mapping ✅ (Task 2). Automatic/background sync triggering is explicitly out of scope (manual "Sync now" only) — a deliberate simplification stated in Global Constraints, not an oversight.
