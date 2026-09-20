@@ -1324,6 +1324,13 @@ describe('useTrackingStore', () => {
     await initSchema(db);
     repo = createActivitiesRepository(db);
     useTrackingStore.getState().__setRepositoryForTest(repo);
+    // useTrackingStore is a module-level singleton, so its zustand state
+    // (not just the injected repo) leaks across tests in this file unless
+    // reset here — without this, a test that deliberately leaves `status`
+    // as 'recording' (like the re-entrancy test below) causes the next
+    // test's startActivity() to silently no-op via the same guard it's
+    // meant to protect, pointing activityId at the previous test's data.
+    useTrackingStore.setState({ status: 'stopped', activityId: null, stepCount: 0, checkpointCount: 0, routePoints: [] });
   });
 
   it('starts an activity and reflects the first route point and step count', async () => {
