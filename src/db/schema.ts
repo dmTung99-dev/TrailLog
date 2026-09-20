@@ -32,4 +32,21 @@ export async function initSchema(db: SqlDatabase): Promise<void> {
       photo_path TEXT
     )
   `);
+
+  const addColumnIfMissing = async (table: string, columnDdl: string) => {
+    try {
+      await db.executeSql(`ALTER TABLE ${table} ADD COLUMN ${columnDdl}`);
+    } catch (error) {
+      // SQLite throws when the column already exists — that's the expected
+      // steady state on every run after the first. Anything else is real.
+      if (!/duplicate column name/i.test(String(error))) {
+        throw error;
+      }
+    }
+  };
+
+  await addColumnIfMissing('activities', 'server_id TEXT');
+  await addColumnIfMissing('activities', 'conflict_server_activity TEXT');
+  await addColumnIfMissing('checkpoints', 'server_id TEXT');
+  await addColumnIfMissing('checkpoints', 'photo_uploaded INTEGER NOT NULL DEFAULT 0');
 }

@@ -23,8 +23,10 @@ export interface Activity {
   endedAt: string | null;
   syncStatus: string;
   updatedAt: string;
+  serverId: string | null;
+  conflictServerActivity: string | null;
   routePoints: Array<RoutePointInput & { id: string }>;
-  checkpoints: Array<CheckpointInput & { id: string; photoPath: string | null }>;
+  checkpoints: Array<CheckpointInput & { id: string; photoPath: string | null; serverId: string | null; photoUploaded: boolean }>;
 }
 
 export interface ActivitiesRepository {
@@ -35,6 +37,11 @@ export interface ActivitiesRepository {
   getActivity(activityId: string): Promise<Activity | null>;
   listActivities(): Promise<Activity[]>;
   updateActivityMetadata(activityId: string, changes: { title?: string; notes?: string }): Promise<void>;
+  listPendingActivities(): Promise<Activity[]>;
+  markActivitySynced(activityId: string, serverId: string, serverUpdatedAt: string): Promise<void>;
+  markActivityConflict(activityId: string, serverActivityJson: string): Promise<void>;
+  markCheckpointSynced(checkpointId: string, serverId: string): Promise<void>;
+  markCheckpointPhotoUploaded(checkpointId: string): Promise<void>;
 }
 
 export function createActivitiesRepository(db: SqlDatabase): ActivitiesRepository {
@@ -52,6 +59,8 @@ export function createActivitiesRepository(db: SqlDatabase): ActivitiesRepositor
       endedAt: row.ended_at ?? null,
       syncStatus: row.sync_status,
       updatedAt: row.updated_at,
+      serverId: row.server_id ?? null,
+      conflictServerActivity: row.conflict_server_activity ?? null,
       routePoints: routePointsRes.rows.map((p: any) => ({
         id: p.id,
         lat: p.lat,
@@ -65,6 +74,8 @@ export function createActivitiesRepository(db: SqlDatabase): ActivitiesRepositor
         lng: c.lng,
         capturedAt: c.captured_at,
         photoPath: c.photo_path ?? null,
+        serverId: c.server_id ?? null,
+        photoUploaded: Boolean(c.photo_uploaded),
       })),
     };
   }
@@ -123,6 +134,33 @@ export function createActivitiesRepository(db: SqlDatabase): ActivitiesRepositor
       if (changes.notes !== undefined) {
         await db.executeSql('UPDATE activities SET notes = ?, updated_at = ? WHERE id = ?', [changes.notes, now, activityId]);
       }
+    },
+
+    async listPendingActivities() {
+      const res = await db.executeSql("SELECT * FROM activities WHERE sync_status = 'pending' ORDER BY started_at ASC", []);
+      return Promise.all(res.rows.map(hydrate));
+    },
+
+    async markActivitySynced(activityId, serverId, serverUpdatedAt) {
+      await db.executeSql(
+        "UPDATE activities SET server_id = ?, sync_status = 'synced', updated_at = ? WHERE id = ?",
+        [serverId, serverUpdatedAt, activityId],
+      );
+    },
+
+    async markActivityConflict(activityId, serverActivityJson) {
+      await db.executeSql(
+        "UPDATE activities SET sync_status = 'conflict', conflict_server_activity = ? WHERE id = ?",
+        [serverActivityJson, activityId],
+      );
+    },
+
+    async markCheckpointSynced(checkpointId, serverId) {
+      await db.executeSql('UPDATE checkpoints SET server_id = ? WHERE id = ?', [serverId, checkpointId]);
+    },
+
+    async markCheckpointPhotoUploaded(checkpointId) {
+      await db.executeSql('UPDATE checkpoints SET photo_uploaded = 1 WHERE id = ?', [checkpointId]);
     },
   };
 }

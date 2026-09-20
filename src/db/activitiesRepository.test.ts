@@ -49,3 +49,58 @@ describe('activitiesRepository', () => {
     expect(activity?.notes).toBe('Nice view');
   });
 });
+
+describe('sync-related repository methods', () => {
+  it('lists only activities whose sync_status is pending, and marks one as synced', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+
+    const activityId = await repo.createActivity({ title: 'Trail run', startedAt: '2026-09-21T07:00:00.000Z' });
+
+    const pendingBefore = await repo.listPendingActivities();
+    expect(pendingBefore.map((a) => a.id)).toContain(activityId);
+
+    await repo.markActivitySynced(activityId, 'server-activity-1', '2026-09-21T08:00:00.000Z');
+
+    const pendingAfter = await repo.listPendingActivities();
+    expect(pendingAfter.map((a) => a.id)).not.toContain(activityId);
+
+    const activity = await repo.getActivity(activityId);
+    expect(activity?.serverId).toBe('server-activity-1');
+    expect(activity?.syncStatus).toBe('synced');
+  });
+
+  it('records a conflict snapshot without changing sync_status back to pending', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+
+    const activityId = await repo.createActivity({ title: 'Evening walk', startedAt: '2026-09-21T18:00:00.000Z' });
+    await repo.markActivitySynced(activityId, 'server-activity-2', '2026-09-21T18:30:00.000Z');
+
+    await repo.markActivityConflict(activityId, JSON.stringify({ id: 'server-activity-2', title: 'Renamed on phone B' }));
+
+    const activity = await repo.getActivity(activityId);
+    expect(activity?.syncStatus).toBe('conflict');
+    expect(JSON.parse(activity!.conflictServerActivity!)).toMatchObject({ title: 'Renamed on phone B' });
+  });
+
+  it('marks a checkpoint synced, then its photo uploaded, independently', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+
+    const activityId = await repo.createActivity({ title: 'Hike', startedAt: '2026-09-21T09:00:00.000Z' });
+    const checkpointId = await repo.addCheckpoint(activityId, { lat: 10.1, lng: 106.1, capturedAt: '2026-09-21T09:05:00.000Z' });
+
+    await repo.markCheckpointSynced(checkpointId, 'server-checkpoint-1');
+    let activity = await repo.getActivity(activityId);
+    expect(activity?.checkpoints[0].serverId).toBe('server-checkpoint-1');
+    expect(activity?.checkpoints[0].photoUploaded).toBe(false);
+
+    await repo.markCheckpointPhotoUploaded(checkpointId);
+    activity = await repo.getActivity(activityId);
+    expect(activity?.checkpoints[0].photoUploaded).toBe(true);
+  });
+});
