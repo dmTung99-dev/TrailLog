@@ -9,17 +9,34 @@ interface Props {
 
 export function ActivitySummaryScreen({ route }: Props) {
   const [activity, setActivity] = useState<Activity | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     (async () => {
-      const db = await createSqliteStorageAdapter();
-      const repo = createActivitiesRepository(db);
-      setActivity(await repo.getActivity(route.params.activityId));
+      try {
+        const db = await createSqliteStorageAdapter();
+        const repo = createActivitiesRepository(db);
+        setActivity(await repo.getActivity(route.params.activityId));
+      } finally {
+        setLoading(false);
+      }
     })();
   }, [route.params.activityId]);
 
+  if (loading) {
+    return (
+      <View>
+        <Text>Loading...</Text>
+      </View>
+    );
+  }
+
   if (!activity) {
-    return null;
+    return (
+      <View>
+        <Text>Activity not found</Text>
+      </View>
+    );
   }
 
   return (
