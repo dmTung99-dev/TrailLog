@@ -1014,6 +1014,37 @@ describe('createSyncEngine', () => {
     expect(activity?.syncStatus).toBe('conflict'); // metadata conflict still surfaced to the user
     expect(activity?.checkpoints.find((c) => c.id === checkpointId)?.serverId).toBe('server-checkpoint-3'); // but the checkpoint made it up anyway
   });
+
+  it('leaves an activity pending, not conflict, if a checkpoint fails in the same pass as a metadata conflict', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+    const activityId = await repo.createActivity({ title: 'Conflict plus failure', startedAt: '2026-09-21T17:00:00.000Z' });
+    await repo.addCheckpoint(activityId, { lat: 10.7, lng: 106.7, capturedAt: '2026-09-21T17:05:00.000Z' });
+    await repo.markActivityServerId(activityId, 'server-4', '2026-09-21T17:00:00.000Z');
+
+    const api = fakeApiClient({
+      updateActivityMetadata: jest.fn().mockResolvedValue({
+        conflict: true,
+        serverActivity: { id: 'server-4', title: 'Renamed elsewhere', updatedAt: '2026-09-21T18:00:00.000Z' },
+      }),
+      createCheckpoint: jest.fn().mockRejectedValue(new Error('network dropped')),
+    });
+    const summary = await createSyncEngine(repo, api as any).syncNow();
+
+    expect(summary).toEqual({ synced: 0, conflicts: 0, failed: 1 });
+
+    const activity = await repo.getActivity(activityId);
+    // The conflict must NOT have been committed -- it was only ever held
+    // in memory pending the checkpoint loop, which then threw. The
+    // activity stays exactly as it was before this attempt: 'pending',
+    // no conflict snapshot, still retryable on the next syncNow().
+    expect(activity?.syncStatus).toBe('pending');
+    expect(activity?.conflictServerActivity).toBeNull();
+
+    const pending = await repo.listPendingActivities();
+    expect(pending.map((a) => a.id)).toContain(activityId);
+  });
 });
 ```
 
@@ -1068,7 +1099,7 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
     try {
       let serverId = activity.serverId;
       let serverUpdatedAt = activity.updatedAt;
-      let hadConflict = false;
+      let conflictPayload: string | null = null;
 
       if (!serverId) {
         // Never reached the server at all yet — full create.
@@ -1097,12 +1128,16 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         });
 
         if ('conflict' in result) {
-          // Record the conflict, but do NOT return yet: checkpoints/photos
-          // are independent of the metadata dispute and must not be
-          // abandoned just because title/notes collided. See the second
-          // design note after this function.
-          await repo.markActivityConflict(activity.id, JSON.stringify(result.serverActivity));
-          hadConflict = true;
+          // Hold the conflict payload rather than writing it now: like
+          // markActivitySynced, markActivityConflict's write removes this
+          // activity from listPendingActivities() (any non-'pending'
+          // status does) — committing it here, before the checkpoint loop
+          // below has run, would repeat the exact bug this task was fixed
+          // for twice already, just via a third status value. The actual
+          // repo.markActivityConflict call happens after the loop, right
+          // before returning 'conflict'. See the third design note after
+          // this function.
+          conflictPayload = JSON.stringify(result.serverActivity);
         } else {
           serverUpdatedAt = result.updatedAt;
         }
@@ -1134,13 +1169,15 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         }
       }
 
-      if (hadConflict) {
+      // Only now — every checkpoint/photo in this pass has actually
+      // reached the server (the loop above would have thrown otherwise,
+      // leaving sync_status untouched at 'pending') — is it safe to write
+      // a terminal, queue-removing status at all.
+      if (conflictPayload) {
+        await repo.markActivityConflict(activity.id, conflictPayload);
         return 'conflict';
       }
 
-      // Only now — the activity itself AND every checkpoint AND every
-      // photo are all confirmed on the server — is this activity actually
-      // fully synced and safe to drop from listPendingActivities().
       await repo.markActivitySynced(activity.id, serverId, serverUpdatedAt);
       return 'synced';
     } catch {
@@ -1169,12 +1206,14 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
 
 **Design note (from Task 4's review):** an earlier version of this file split `pushNewActivity`/`pushMetadataEdit` into two functions, routed by `activity.serverId ? pushMetadataEdit : pushNewActivity`, and `pushNewActivity` called `markActivitySynced` (flipping `sync_status` to `'synced'`) *before* looping over checkpoints. Since `SqlDatabase` has no transactions, a checkpoint or photo failure partway through that loop left the activity already marked `'synced'` with a real `server_id` — so it silently vanished from every future `listPendingActivities()` call, permanently stranding whatever checkpoints/photos hadn't made it up yet, with no error and no way to retry. The fix merges both functions into one `pushActivity`: `markActivityServerId` (new) records the server id *without* changing `sync_status`, the checkpoint/photo loop is written to be idempotent (skip anything that already has a `serverId`/`photoUploaded`), and `markActivitySynced` — the thing that actually removes the activity from the pending queue — only runs after that whole loop succeeds. A retried `syncNow()` on a partially-synced activity now skips `createActivity` entirely (since `serverId` is already set) and resumes exactly where it left off.
 
-**Second design note (from re-review after the first fix):** the first fix above still had two holes. First, `markActivityServerId` originally left `updated_at` alone, so a retry's `clientUpdatedAt` was still the *local creation* timestamp — the real backend's conflict rule (`current.updatedAt > clientSawAt`) reads that stale value as a genuine conflict on every ordinary resume, not just on a real concurrent edit, since the server's own `updatedAt` (stamped when `createActivity` first ran) is always later than the phone's local creation time. `markActivityServerId` now also writes the server's `updatedAt`, so a plain resume's `clientUpdatedAt` matches what the server already has and doesn't trip the conflict check — while a genuine local edit still overwrites `updated_at` to local-now via `updateActivityMetadata`, which is still ≥ the server's last-known value, so real edits keep working correctly. Second, the original code `return`ed immediately on a metadata conflict, before the checkpoint loop ever ran — meaning the *common* case of "resume hits a conflict" (before the first fix above, that was almost every resume) abandoned any outstanding checkpoints exactly the way the original bug did, just reached through the conflict branch instead of an exception. The fix now records the conflict (`hadConflict = true`) but keeps going into the checkpoint loop regardless — checkpoints and photos are independent sub-resources of an already-created activity, so a metadata dispute over title/notes has no bearing on whether they should be pushed. The final `synced` vs. `conflict` decision happens only after that loop, so a resolved metadata conflict never comes at the cost of stranded checkpoints.
+**Second design note (from re-review after the first fix):** the first fix above still had two holes. First, `markActivityServerId` originally left `updated_at` alone, so a retry's `clientUpdatedAt` was still the *local creation* timestamp — the real backend's conflict rule (`current.updatedAt > clientSawAt`) reads that stale value as a genuine conflict on every ordinary resume, not just on a real concurrent edit, since the server's own `updatedAt` (stamped when `createActivity` first ran) is always later than the phone's local creation time. `markActivityServerId` now also writes the server's `updatedAt`, so a plain resume's `clientUpdatedAt` matches what the server already has and doesn't trip the conflict check — while a genuine local edit still overwrites `updated_at` to local-now via `updateActivityMetadata`, which is still ≥ the server's last-known value, so real edits keep working correctly. Second, the original code `return`ed immediately on a metadata conflict, before the checkpoint loop ever ran — meaning the *common* case of "resume hits a conflict" (before the first fix above, that was almost every resume) abandoned any outstanding checkpoints exactly the way the original bug did, just reached through the conflict branch instead of an exception. The fix records that a conflict happened but keeps going into the checkpoint loop regardless — checkpoints and photos are independent sub-resources of an already-created activity, so a metadata dispute over title/notes has no bearing on whether they should be pushed.
+
+**Third design note (from a second re-review — the same bug class, one status value later):** the second fix above still called `repo.markActivityConflict` *immediately* on detecting a conflict, before the checkpoint loop ran — it only deferred the `return`, not the database write. But `markActivityConflict`'s write removes the activity from `listPendingActivities()` exactly as `markActivitySynced`'s does (any `sync_status` other than `'pending'` does), so a checkpoint failure in the *same pass* as a metadata conflict would commit `sync_status = 'conflict'` and then throw out of the loop — parking the activity in a state with an unsynced checkpoint and no retry path, the third occurrence of the original bug via a third code path. The fix above holds the conflict payload in a local `conflictPayload` variable instead of writing it immediately, and only calls `repo.markActivityConflict` after the checkpoint loop has fully succeeded, symmetric with how `markActivitySynced` is already deferred. If the loop throws, execution never reaches either terminal write, `catch` returns `'failed'`, and `sync_status` is untouched at `'pending'` — retryable, as it should be. This is the same fix shape applied a third time to the same underlying rule: never write a status that removes an activity from the sync queue until every checkpoint and photo in that same pass has actually succeeded.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `npx jest syncEngine`
-Expected: PASS — all seven cases green (the original five, the resume-after-partial-failure case, and the conflict-still-pushes-checkpoints case).
+Expected: PASS — all eight cases green (the original five, the resume-after-partial-failure case, the conflict-still-pushes-checkpoints case, and the conflict-plus-failure-stays-pending case).
 
 - [ ] **Step 6: Commit**
 
