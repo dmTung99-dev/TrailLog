@@ -14,3 +14,37 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 }
+
+model Activity {
+  id         String       @id @default(uuid())
+  userId     String
+  title      String
+  notes      String?
+  visibility String       @default("private")
+  startedAt  DateTime
+  endedAt    DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  routePoints RoutePoint[]
+  checkpoints Checkpoint[]
+}
+
+model RoutePoint {
+  id         String   @id @default(uuid())
+  activityId String
+  activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  lat        Float
+  lng        Float
+  recordedAt DateTime
+  sequence   Int
+}
+
+model Checkpoint {
+  id         String   @id @default(uuid())
+  activityId String
+  activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  lat        Float
+  lng        Float
+  capturedAt DateTime
+  photoUrl   String?
+}
