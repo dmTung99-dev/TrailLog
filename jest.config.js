@@ -3,7 +3,10 @@ module.exports = {
   // e2e/ contains Detox specs that rely on Detox's own test runner and
   // globals (device/by/element), configured separately via e2e/jest.config.js.
   // They must not be picked up by the plain unit-test run.
-  testPathIgnorePatterns: ['/node_modules/', '<rootDir>/e2e/'],
+  // backend/ is a separate NestJS project (its own package.json, its own
+  // Jest config) meant to be built/tested from inside backend/, not swept
+  // up by this app's root-level `npx jest`.
+  testPathIgnorePatterns: ['/node_modules/', '<rootDir>/e2e/', '<rootDir>/backend/'],
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
     '^react-native-permissions$': '<rootDir>/src/__mocks__/react-native-permissions.js',
