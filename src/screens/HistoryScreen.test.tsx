@@ -1,7 +1,8 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react-native';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react-native';
 import { HistoryScreen } from './HistoryScreen';
 import * as repoModule from '../db/activitiesRepository';
+import * as syncEngineModule from '../sync/syncEngine';
 import { useNavigation } from '@react-navigation/native';
 
 jest.mock('../db/sqliteStorageAdapter', () => ({ createSqliteStorageAdapter: jest.fn() }));
@@ -25,5 +26,21 @@ describe('HistoryScreen', () => {
 
     await waitFor(() => expect(screen.getByText('Morning hike')).toBeTruthy());
     expect(screen.getByText('Evening walk')).toBeTruthy();
+  });
+
+  it('runs sync and shows a summary when "Sync now" is pressed', async () => {
+    (useNavigation as jest.Mock).mockReturnValue({
+      navigate: jest.fn(),
+    });
+    jest.spyOn(repoModule, 'createActivitiesRepository').mockReturnValue({
+      listActivities: jest.fn().mockResolvedValue([]),
+    } as any);
+    const syncNow = jest.fn().mockResolvedValue({ synced: 2, conflicts: 1, failed: 0 });
+    jest.spyOn(syncEngineModule, 'createSyncEngine').mockReturnValue({ syncNow });
+
+    render(<HistoryScreen />);
+    fireEvent.press(screen.getByText('Sync now'));
+
+    await waitFor(() => expect(screen.getByText('Synced 2, 1 conflict')).toBeTruthy());
   });
 });

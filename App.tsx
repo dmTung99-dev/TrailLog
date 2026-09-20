@@ -7,6 +7,7 @@ import { HistoryScreen } from './src/screens/HistoryScreen';
 import { ActivitySummaryScreen } from './src/screens/ActivitySummaryScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
 import { RegisterScreen } from './src/screens/RegisterScreen';
+import { ConflictResolutionScreen } from './src/screens/ConflictResolutionScreen';
 import { useAuthStore } from './src/store/authStore';
 
 export type RootStackParamList = {
@@ -16,6 +17,7 @@ export type RootStackParamList = {
   ActivitySummary: { activityId: string };
   Login: undefined;
   Register: undefined;
+  ConflictResolution: { activityId: string };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -44,6 +46,7 @@ export default function App() {
         <Stack.Screen name="ActivitySummary" component={ActivitySummaryScreen} options={{ title: 'Summary' }} />
         <Stack.Screen name="Login" component={LoginScreen} options={{ title: 'Log In' }} />
         <Stack.Screen name="Register" component={RegisterScreen} options={{ title: 'Register' }} />
+        <Stack.Screen name="ConflictResolution" component={ConflictResolutionScreen} options={{ title: 'Resolve conflict' }} />
       </Stack.Navigator>
     </NavigationContainer>
   );
