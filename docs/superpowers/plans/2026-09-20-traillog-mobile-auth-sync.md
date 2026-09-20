@@ -1416,7 +1416,7 @@ import { ConflictResolutionScreen } from './src/screens/ConflictResolutionScreen
         <Stack.Screen name="ConflictResolution" component={ConflictResolutionScreen} options={{ title: 'Resolve conflict' }} />
 ```
 
-Note: `takeServerVersion`'s next real sync pass will push this activity's metadata again — since `updateActivityMetadata` here only updates local title/notes (not `sync_status`, which stays `'conflict'` after this call in the repository method as currently written), a full resolution flow would also need to flip `sync_status` back to `'pending'` so the next `syncNow()` retries it. This plan intentionally leaves that as a one-line follow-up rather than adding a sixth repository method for it — flag it in your task report rather than silently adding scope, and if there's time, add `sync_status = 'pending'` to the end of `updateActivityMetadata`'s existing UPDATE statements in Task 2's file instead of introducing a new method.
+Note: `takeServerVersion`'s next real sync pass needs `updateActivityMetadata` to flip `sync_status` back to `'pending'` so `syncNow()` retries it. This was already fixed ahead of this task, during Task 4 (commit `dcd6dd3`, since Task 4's own tests needed the same behavior) — `updateActivityMetadata`'s two UPDATE statements already set `sync_status = 'pending'` unconditionally. Nothing further to do here; a Task 5 implementer should confirm this via the existing repository test rather than re-adding it.
 
 - [ ] **Step 8: Run the test to verify it passes**
 
@@ -1428,6 +1428,86 @@ Expected: PASS — both cases green.
 ```bash
 git add src/screens/HistoryScreen.tsx src/screens/ConflictResolutionScreen.tsx App.tsx src/screens/HistoryScreen.test.tsx src/screens/ConflictResolutionScreen.test.tsx
 git commit -m "feat: add sync trigger and conflict resolution UI"
+```
+
+---
+
+### Task 6: Reach `ConflictResolutionScreen` from the app — a navigation dead end found by Task 5's review
+
+Added after Task 5's review found that nothing in the app ever navigates to `'ConflictResolution'` — `HistoryScreen`'s row press only ever goes to `ActivitySummary`, and the brief's own task header for Task 5 had already promised a "per-item sync-status/conflict indicator" that Step 3's literal code never delivered. Without both, a real user who hits a genuine sync conflict has no way to discover it or reach the screen built to resolve it — conflict resolution, the entire point of Task 5, ships unreachable. This is the same class of gap the mobile-core plan's final review found for `HistoryScreen`/`TrackingScreen` before a follow-up added navigation buttons to `HomeScreen`.
+
+**Files:**
+- Modify: `src/screens/HistoryScreen.tsx` (per-row sync-status text; a "Resolve" button shown only for a conflicted row)
+- Test: extend `src/screens/HistoryScreen.test.tsx`
+
+**Interfaces:**
+- Consumes: `Activity.syncStatus` (already exists, from the mobile-core plan's Task 2), `useNavigation` (already used elsewhere in this file for the row-press-to-`ActivitySummary` case — read the current file to match its exact navigation-mocking convention in the test, rather than guessing at one here).
+- Produces: nothing new consumed elsewhere — this is the last task in this plan.
+
+- [ ] **Step 1: Write the failing test**
+
+Read the current `src/screens/HistoryScreen.test.tsx` in full first — it already mocks `useNavigation`/`createActivitiesRepository` somehow (the exact mechanism was chosen by Task 5's implementer and by the mobile-core plan before it); add a new test using that same established mechanism, shaped like this:
+
+```tsx
+// src/screens/HistoryScreen.test.tsx (add this case, matching the file's actual existing mocking style)
+it('shows a Resolve button only for a conflicted activity, navigating to ConflictResolution', async () => {
+  const navigate = jest.fn(); // wire this into whatever useNavigation mock the file already has
+  jest.spyOn(repoModule, 'createActivitiesRepository').mockReturnValue({
+    listActivities: jest.fn().mockResolvedValue([
+      { id: '1', title: 'Conflicted hike', startedAt: '2026-09-21T07:00:00.000Z', syncStatus: 'conflict', routePoints: [], checkpoints: [] },
+      { id: '2', title: 'Synced walk', startedAt: '2026-09-20T18:00:00.000Z', syncStatus: 'synced', routePoints: [], checkpoints: [] },
+    ]),
+  } as any);
+
+  render(<HistoryScreen />);
+  await waitFor(() => expect(screen.getByText('Conflicted hike')).toBeTruthy());
+
+  // Only the conflicted row gets a Resolve button.
+  expect(screen.getAllByText('Resolve')).toHaveLength(1);
+
+  fireEvent.press(screen.getByText('Resolve'));
+  expect(navigate).toHaveBeenCalledWith('ConflictResolution', { activityId: '1' });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx jest HistoryScreen`
+Expected: FAIL — no "Resolve" text found.
+
+- [ ] **Step 3: Add the per-row status and Resolve button**
+
+```tsx
+// src/screens/HistoryScreen.tsx — extend renderItem to show sync status and,
+// only for a conflicted activity, a "Resolve" button. Apply this against the
+// file's real current renderItem (which already wraps the title in a
+// TouchableOpacity navigating to ActivitySummary) rather than replacing it
+// wholesale — the title press behavior must be unchanged.
+      renderItem={({ item }) => (
+        <View>
+          <TouchableOpacity onPress={() => navigation.navigate('ActivitySummary', { activityId: item.id })}>
+            <Text>{item.title}</Text>
+          </TouchableOpacity>
+          <Text>
+            {item.syncStatus === 'conflict' ? 'Conflict' : item.syncStatus === 'pending' ? 'Not synced' : 'Synced'}
+          </Text>
+          {item.syncStatus === 'conflict' && (
+            <Button title="Resolve" onPress={() => navigation.navigate('ConflictResolution', { activityId: item.id })} />
+          )}
+        </View>
+      )}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx jest HistoryScreen`
+Expected: PASS — the new case plus every pre-existing case green, including the ones from the mobile-core plan and Task 5 that don't set `syncStatus` on their fixtures at all (those should still render fine — an `undefined` `syncStatus` falls through to the `'Synced'` branch harmlessly, since nothing asserts on that text for those fixtures).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/screens/HistoryScreen.tsx src/screens/HistoryScreen.test.tsx
+git commit -m "fix: make conflicted activities discoverable and reachable from HistoryScreen"
 ```
 
 ---
