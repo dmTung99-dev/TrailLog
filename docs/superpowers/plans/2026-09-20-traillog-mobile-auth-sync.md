@@ -803,11 +803,13 @@ git commit -m "feat: add login/register screens with session persistence"
 
 **Files:**
 - Create: `src/sync/syncEngine.ts`
+- Modify: `src/db/activitiesRepository.ts` (add `markActivityServerId`; also already required to add a `sync_status = 'pending'` reset to `updateActivityMetadata`, per Task 5's original note — moved earlier since this task's own tests need it)
 - Test: `src/sync/syncEngine.test.ts`
+- Test: extend `src/db/activitiesRepository.test.ts`
 
 **Interfaces:**
-- Consumes: `ActivitiesRepository` (Task 2's sync methods), `ApiClient` (Task 1).
-- Produces: `createSyncEngine(repo, apiClient): { syncNow(): Promise<SyncSummary> }` where `SyncSummary = { synced: number; conflicts: number; failed: number }` — Task 5's UI calls `syncNow()` and reads the summary to show the user what happened.
+- Consumes: `ActivitiesRepository` (Task 2's sync methods, plus `markActivityServerId` added by this task), `ApiClient` (Task 1).
+- Produces: `createSyncEngine(repo, apiClient): { syncNow(): Promise<SyncSummary> }` where `SyncSummary = { synced: number; conflicts: number; failed: number }` — Task 5's UI calls `syncNow()` and reads the summary to show the user what happened. `ActivitiesRepository.markActivityServerId(activityId, serverId): Promise<void>` — records the server-assigned id on first contact *without* changing `sync_status` away from `'pending'`, so an activity whose checkpoint/photo sync is interrupted partway stays visible to the next `listPendingActivities()` call instead of vanishing (see the design note after Step 3).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -933,6 +935,50 @@ describe('createSyncEngine', () => {
     expect(activity?.title).toBe('Renamed on this phone'); // never silently overwritten
     expect(JSON.parse(activity!.conflictServerActivity!).title).toBe('Renamed on the other phone');
   });
+
+  it('resumes a partially-synced activity on retry instead of re-creating it or losing remaining checkpoints', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+    const activityId = await repo.createActivity({ title: 'Two checkpoints', startedAt: '2026-09-21T13:00:00.000Z' });
+    const checkpoint1Id = await repo.addCheckpoint(activityId, { lat: 10.4, lng: 106.4, capturedAt: '2026-09-21T13:05:00.000Z' });
+    const checkpoint2Id = await repo.addCheckpoint(activityId, { lat: 10.5, lng: 106.5, capturedAt: '2026-09-21T13:10:00.000Z' });
+
+    // First attempt: the activity itself and checkpoint 1 succeed;
+    // checkpoint 2's creation fails partway (simulating a dropped
+    // connection mid-sync).
+    const failingApi = fakeApiClient({
+      createCheckpoint: jest
+        .fn()
+        .mockResolvedValueOnce({ id: 'server-checkpoint-1' })
+        .mockRejectedValueOnce(new Error('network dropped')),
+    });
+    const firstSummary = await createSyncEngine(repo, failingApi as any).syncNow();
+
+    expect(firstSummary).toEqual({ synced: 0, conflicts: 0, failed: 1 });
+
+    let activity = await repo.getActivity(activityId);
+    expect(activity?.syncStatus).toBe('pending'); // must still be retryable, not silently lost
+    expect(activity?.serverId).toBe('server-1'); // the activity itself was created
+    expect(activity?.checkpoints.find((c) => c.id === checkpoint1Id)?.serverId).toBe('server-checkpoint-1'); // survived
+
+    // Second attempt: everything succeeds. The activity must NOT be
+    // re-created, and checkpoint 1 must NOT be re-created either — only
+    // the still-outstanding checkpoint 2 should go up.
+    const succeedingApi = fakeApiClient({
+      createCheckpoint: jest.fn().mockResolvedValue({ id: 'server-checkpoint-2' }),
+    });
+    const secondSummary = await createSyncEngine(repo, succeedingApi as any).syncNow();
+
+    expect(secondSummary).toEqual({ synced: 1, conflicts: 0, failed: 0 });
+    expect(succeedingApi.createActivity).not.toHaveBeenCalled();
+    expect(succeedingApi.createCheckpoint).toHaveBeenCalledTimes(1);
+    expect(succeedingApi.createCheckpoint).toHaveBeenCalledWith('server-1', expect.objectContaining({ lat: 10.5, lng: 106.5 }));
+
+    activity = await repo.getActivity(activityId);
+    expect(activity?.syncStatus).toBe('synced');
+    expect(activity?.checkpoints.find((c) => c.id === checkpoint2Id)?.serverId).toBe('server-checkpoint-2');
+  });
 });
 ```
 
@@ -941,11 +987,28 @@ describe('createSyncEngine', () => {
 Run: `npx jest syncEngine`
 Expected: FAIL — `Cannot find module './syncEngine'`.
 
-- [ ] **Step 3: Implement the sync engine**
+- [ ] **Step 3: Add `markActivityServerId` to the repository**
+
+```typescript
+// src/db/activitiesRepository.ts — add to the ActivitiesRepository interface
+  markActivityServerId(activityId: string, serverId: string): Promise<void>;
+
+// ...and to createActivitiesRepository(db)'s returned object, alongside the
+// existing markActivitySynced/markActivityConflict/etc:
+    async markActivityServerId(activityId, serverId) {
+      // Deliberately does NOT touch sync_status — the activity stays
+      // 'pending' (visible to listPendingActivities()) until the sync
+      // engine has also finished pushing every checkpoint and photo. See
+      // the design note after Step 4 for why this split matters.
+      await db.executeSql('UPDATE activities SET server_id = ? WHERE id = ?', [serverId, activityId]);
+    },
+```
+
+- [ ] **Step 4: Implement the sync engine**
 
 ```typescript
 // src/sync/syncEngine.ts
-import { ActivitiesRepository } from '../db/activitiesRepository';
+import { Activity, ActivitiesRepository } from '../db/activitiesRepository';
 import { ApiClient } from '../api/apiClient';
 
 export interface SyncSummary {
@@ -955,24 +1018,59 @@ export interface SyncSummary {
 }
 
 export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClient) {
-  async function pushNewActivity(activity: Awaited<ReturnType<ActivitiesRepository['getActivity']>>): Promise<'synced' | 'failed'> {
-    if (!activity) return 'failed';
+  async function pushActivity(activity: Activity): Promise<'synced' | 'conflict' | 'failed'> {
     try {
-      const server = await apiClient.createActivity({
-        title: activity.title,
-        notes: activity.notes ?? undefined,
-        startedAt: activity.startedAt,
-        endedAt: activity.endedAt ?? undefined,
-        routePoints: activity.routePoints.map((p) => ({ lat: p.lat, lng: p.lng, recordedAt: p.recordedAt, sequence: p.sequence })),
-      });
-      await repo.markActivitySynced(activity.id, server.id, server.updatedAt);
+      let serverId = activity.serverId;
+      let serverUpdatedAt = activity.updatedAt;
 
+      if (!serverId) {
+        // Never reached the server at all yet — full create.
+        const server = await apiClient.createActivity({
+          title: activity.title,
+          notes: activity.notes ?? undefined,
+          startedAt: activity.startedAt,
+          endedAt: activity.endedAt ?? undefined,
+          routePoints: activity.routePoints.map((p) => ({ lat: p.lat, lng: p.lng, recordedAt: p.recordedAt, sequence: p.sequence })),
+        });
+        serverId = server.id;
+        serverUpdatedAt = server.updatedAt;
+        await repo.markActivityServerId(activity.id, serverId);
+      } else {
+        // Already exists on the server — either resuming a sync that was
+        // interrupted before its checkpoints finished, or this is a
+        // genuine local metadata edit after a prior full sync. Push the
+        // current local title/notes either way; harmless if nothing
+        // changed since the server's last copy.
+        const result = await apiClient.updateActivityMetadata(serverId, {
+          title: activity.title,
+          notes: activity.notes ?? undefined,
+          clientUpdatedAt: activity.updatedAt,
+        });
+
+        if ('conflict' in result) {
+          await repo.markActivityConflict(activity.id, JSON.stringify(result.serverActivity));
+          return 'conflict';
+        }
+        serverUpdatedAt = result.updatedAt;
+      }
+
+      // Idempotent on purpose: skip any checkpoint/photo that already
+      // reached the server on an earlier, interrupted attempt, so retrying
+      // a partially-synced activity never re-creates a checkpoint.
       for (const checkpoint of activity.checkpoints) {
-        const serverCheckpoint = await apiClient.createCheckpoint(server.id, { lat: checkpoint.lat, lng: checkpoint.lng, capturedAt: checkpoint.capturedAt });
-        await repo.markCheckpointSynced(checkpoint.id, serverCheckpoint.id);
+        let serverCheckpointId = checkpoint.serverId;
+        if (!serverCheckpointId) {
+          const serverCheckpoint = await apiClient.createCheckpoint(serverId, {
+            lat: checkpoint.lat,
+            lng: checkpoint.lng,
+            capturedAt: checkpoint.capturedAt,
+          });
+          serverCheckpointId = serverCheckpoint.id;
+          await repo.markCheckpointSynced(checkpoint.id, serverCheckpointId);
+        }
 
-        if (checkpoint.photoPath) {
-          await apiClient.uploadCheckpointPhoto(server.id, serverCheckpoint.id, {
+        if (checkpoint.photoPath && !checkpoint.photoUploaded) {
+          await apiClient.uploadCheckpointPhoto(serverId, serverCheckpointId, {
             uri: checkpoint.photoPath,
             name: `${checkpoint.id}.jpg`,
             type: 'image/jpeg',
@@ -981,27 +1079,10 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         }
       }
 
-      return 'synced';
-    } catch {
-      return 'failed';
-    }
-  }
-
-  async function pushMetadataEdit(activity: Awaited<ReturnType<ActivitiesRepository['getActivity']>>): Promise<'synced' | 'conflict' | 'failed'> {
-    if (!activity?.serverId) return 'failed';
-    try {
-      const result = await apiClient.updateActivityMetadata(activity.serverId, {
-        title: activity.title,
-        notes: activity.notes ?? undefined,
-        clientUpdatedAt: activity.updatedAt,
-      });
-
-      if ('conflict' in result && result.conflict) {
-        await repo.markActivityConflict(activity.id, JSON.stringify(result.serverActivity));
-        return 'conflict';
-      }
-
-      await repo.markActivitySynced(activity.id, result.id, result.updatedAt);
+      // Only now — the activity itself AND every checkpoint AND every
+      // photo are all confirmed on the server — is this activity actually
+      // fully synced and safe to drop from listPendingActivities().
+      await repo.markActivitySynced(activity.id, serverId, serverUpdatedAt);
       return 'synced';
     } catch {
       return 'failed';
@@ -1013,9 +1094,8 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
       const summary: SyncSummary = { synced: 0, conflicts: 0, failed: 0 };
       const pending = await repo.listPendingActivities();
 
-      for (const summaryRow of pending) {
-        const activity = await repo.getActivity(summaryRow.id);
-        const outcome = activity?.serverId ? await pushMetadataEdit(activity) : await pushNewActivity(activity);
+      for (const activity of pending) {
+        const outcome = await pushActivity(activity);
 
         if (outcome === 'synced') summary.synced += 1;
         else if (outcome === 'conflict') summary.conflicts += 1;
@@ -1028,15 +1108,17 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+**Design note (from Task 4's review):** an earlier version of this file split `pushNewActivity`/`pushMetadataEdit` into two functions, routed by `activity.serverId ? pushMetadataEdit : pushNewActivity`, and `pushNewActivity` called `markActivitySynced` (flipping `sync_status` to `'synced'`) *before* looping over checkpoints. Since `SqlDatabase` has no transactions, a checkpoint or photo failure partway through that loop left the activity already marked `'synced'` with a real `server_id` — so it silently vanished from every future `listPendingActivities()` call, permanently stranding whatever checkpoints/photos hadn't made it up yet, with no error and no way to retry. The fix merges both functions into one `pushActivity`: `markActivityServerId` (new) records the server id *without* changing `sync_status`, the checkpoint/photo loop is written to be idempotent (skip anything that already has a `serverId`/`photoUploaded`), and `markActivitySynced` — the thing that actually removes the activity from the pending queue — only runs after that whole loop succeeds. A retried `syncNow()` on a partially-synced activity now skips `createActivity` entirely (since `serverId` is already set) and resumes exactly where it left off.
+
+- [ ] **Step 5: Run the test to verify it passes**
 
 Run: `npx jest syncEngine`
-Expected: PASS — all five cases green.
+Expected: PASS — all six cases green (the original five plus the new resume-after-partial-failure case).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/sync
+git add src/sync src/db/activitiesRepository.ts src/db/activitiesRepository.test.ts
 git commit -m "feat: add SyncEngine pushing pending activities, checkpoints, and photos"
 ```
 
