@@ -599,7 +599,7 @@ git commit -m "feat: add Postgres/Prisma and JWT-based register/login"
 
 **Interfaces:**
 - Consumes: `PrismaService`, `JwtAuthGuard`, `req.user.userId` from Task 2.
-- Produces: `ActivitiesService.create/findAllForUser/findOneForUser/updateMetadata` — `updateMetadata`'s signature is fixed here and consumed unchanged by Task 4 (conflict resolution) and by Task 5 (checkpoint photo endpoint reuses `findOneForUser` for ownership checks).
+- Produces: `ActivitiesService.create/findAllForUser/findOneForUser` — Task 4 adds `updateMetadata` to this same class (not part of this task's own deliverable, despite the class being shared); its signature, once added, is consumed unchanged by Task 5 (checkpoint photo endpoint reuses `findOneForUser` for ownership checks).
 
 - [ ] **Step 1: Write the failing e2e test**
 
