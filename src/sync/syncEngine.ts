@@ -12,6 +12,7 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
     try {
       let serverId = activity.serverId;
       let serverUpdatedAt = activity.updatedAt;
+      let hadConflict = false;
 
       if (!serverId) {
         // Never reached the server at all yet — full create.
@@ -24,13 +25,15 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         });
         serverId = server.id;
         serverUpdatedAt = server.updatedAt;
-        await repo.markActivityServerId(activity.id, serverId);
+        await repo.markActivityServerId(activity.id, serverId, serverUpdatedAt);
       } else {
         // Already exists on the server — either resuming a sync that was
         // interrupted before its checkpoints finished, or this is a
         // genuine local metadata edit after a prior full sync. Push the
         // current local title/notes either way; harmless if nothing
-        // changed since the server's last copy.
+        // changed since the server's last copy (markActivityServerId
+        // keeps clientUpdatedAt in step with the server's own timestamp,
+        // so a plain resume never looks like a conflict on its own).
         const result = await apiClient.updateActivityMetadata(serverId, {
           title: activity.title,
           notes: activity.notes ?? undefined,
@@ -38,15 +41,21 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         });
 
         if ('conflict' in result) {
+          // Record the conflict, but do NOT return yet: checkpoints/photos
+          // are independent of the metadata dispute and must not be
+          // abandoned just because title/notes collided. See the second
+          // design note after this function.
           await repo.markActivityConflict(activity.id, JSON.stringify(result.serverActivity));
-          return 'conflict';
+          hadConflict = true;
+        } else {
+          serverUpdatedAt = result.updatedAt;
         }
-        serverUpdatedAt = result.updatedAt;
       }
 
       // Idempotent on purpose: skip any checkpoint/photo that already
       // reached the server on an earlier, interrupted attempt, so retrying
-      // a partially-synced activity never re-creates a checkpoint.
+      // a partially-synced activity never re-creates a checkpoint. Runs
+      // even when the metadata push above conflicted.
       for (const checkpoint of activity.checkpoints) {
         let serverCheckpointId = checkpoint.serverId;
         if (!serverCheckpointId) {
@@ -67,6 +76,10 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
           });
           await repo.markCheckpointPhotoUploaded(checkpoint.id);
         }
+      }
+
+      if (hadConflict) {
+        return 'conflict';
       }
 
       // Only now — the activity itself AND every checkpoint AND every

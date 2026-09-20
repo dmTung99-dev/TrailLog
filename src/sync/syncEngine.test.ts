@@ -167,4 +167,32 @@ describe('createSyncEngine', () => {
     expect(activity?.syncStatus).toBe('synced');
     expect(activity?.checkpoints.find((c) => c.id === checkpoint2Id)?.serverId).toBe('server-checkpoint-2');
   });
+
+  it('still pushes an outstanding checkpoint even when the metadata push conflicts', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+    const activityId = await repo.createActivity({ title: 'Partially synced', startedAt: '2026-09-21T15:00:00.000Z' });
+    const checkpointId = await repo.addCheckpoint(activityId, { lat: 10.6, lng: 106.6, capturedAt: '2026-09-21T15:05:00.000Z' });
+    // Simulates: the activity itself already reached the server on an
+    // earlier attempt, but its one checkpoint never made it up before
+    // that attempt was interrupted.
+    await repo.markActivityServerId(activityId, 'server-3', '2026-09-21T15:00:00.000Z');
+
+    const api = fakeApiClient({
+      updateActivityMetadata: jest.fn().mockResolvedValue({
+        conflict: true,
+        serverActivity: { id: 'server-3', title: 'Renamed elsewhere', updatedAt: '2026-09-21T16:00:00.000Z' },
+      }),
+      createCheckpoint: jest.fn().mockResolvedValue({ id: 'server-checkpoint-3' }),
+    });
+    const summary = await createSyncEngine(repo, api as any).syncNow();
+
+    expect(summary).toEqual({ synced: 0, conflicts: 1, failed: 0 });
+    expect(api.createCheckpoint).toHaveBeenCalledWith('server-3', expect.objectContaining({ lat: 10.6, lng: 106.6 }));
+
+    const activity = await repo.getActivity(activityId);
+    expect(activity?.syncStatus).toBe('conflict'); // metadata conflict still surfaced to the user
+    expect(activity?.checkpoints.find((c) => c.id === checkpointId)?.serverId).toBe('server-checkpoint-3'); // but the checkpoint made it up anyway
+  });
 });

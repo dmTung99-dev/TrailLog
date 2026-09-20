@@ -39,7 +39,7 @@ export interface ActivitiesRepository {
   updateActivityMetadata(activityId: string, changes: { title?: string; notes?: string }): Promise<void>;
   listPendingActivities(): Promise<Activity[]>;
   markActivitySynced(activityId: string, serverId: string, serverUpdatedAt: string): Promise<void>;
-  markActivityServerId(activityId: string, serverId: string): Promise<void>;
+  markActivityServerId(activityId: string, serverId: string, serverUpdatedAt: string): Promise<void>;
   markActivityConflict(activityId: string, serverActivityJson: string): Promise<void>;
   markCheckpointSynced(checkpointId: string, serverId: string): Promise<void>;
   markCheckpointPhotoUploaded(checkpointId: string): Promise<void>;
@@ -155,12 +155,23 @@ export function createActivitiesRepository(db: SqlDatabase): ActivitiesRepositor
       );
     },
 
-    async markActivityServerId(activityId, serverId) {
+    async markActivityServerId(activityId, serverId, serverUpdatedAt) {
       // Deliberately does NOT touch sync_status — the activity stays
       // 'pending' (visible to listPendingActivities()) until the sync
       // engine has also finished pushing every checkpoint and photo. See
       // the design note after Step 4 for why this split matters.
-      await db.executeSql('UPDATE activities SET server_id = ? WHERE id = ?', [serverId, activityId]);
+      //
+      // DOES record the server's updated_at (unlike an earlier draft of
+      // this method, which left it alone). Without this, a retried sync's
+      // clientUpdatedAt would still be the *local creation* timestamp, and
+      // the backend's own conflict rule (current.updatedAt > clientSawAt)
+      // would read that stale value as a real conflict on every resume —
+      // wrongly, since nothing has actually changed. See the second design
+      // note after Step 4.
+      await db.executeSql(
+        'UPDATE activities SET server_id = ?, updated_at = ? WHERE id = ?',
+        [serverId, serverUpdatedAt, activityId],
+      );
     },
 
     async markActivityConflict(activityId, serverActivityJson) {
