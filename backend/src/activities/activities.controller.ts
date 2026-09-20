@@ -8,17 +8,21 @@ import {
   Patch,
   Post,
   Req,
+  Res,
   UploadedFile,
   UseGuards,
   UseInterceptors,
   NotFoundException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
+import * as path from 'path';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
 import { STORAGE_SERVICE, StorageService } from '../storage/storage.service';
 import { ActivitiesService } from './activities.service';
 import { CreateActivityDto } from './dto/create-activity.dto';
+import { CreateCheckpointDto } from './dto/create-checkpoint.dto';
 import { UpdateActivityDto } from './dto/update-activity.dto';
 
 interface AuthedRequest {
@@ -59,6 +63,15 @@ export class ActivitiesController {
     return result.activity;
   }
 
+  @Post(':activityId/checkpoints')
+  createCheckpoint(
+    @Req() req: AuthedRequest,
+    @Param('activityId') activityId: string,
+    @Body() dto: CreateCheckpointDto,
+  ) {
+    return this.activitiesService.createCheckpoint(req.user.userId, activityId, dto);
+  }
+
   @Post(':activityId/checkpoints/:checkpointId/photo')
   @UseInterceptors(FileInterceptor('photo'))
   async uploadCheckpointPhoto(
@@ -84,5 +97,24 @@ export class ActivitiesController {
       where: { id: checkpointId },
       data: { photoUrl },
     });
+  }
+
+  @Get(':activityId/checkpoints/:checkpointId/photo')
+  async getCheckpointPhoto(
+    @Req() req: AuthedRequest,
+    @Param('activityId') activityId: string,
+    @Param('checkpointId') checkpointId: string,
+    @Res() res: Response,
+  ) {
+    await this.activitiesService.findOneForUser(req.user.userId, activityId); // ownership check
+    const checkpoint = await this.prisma.checkpoint.findFirst({
+      where: { id: checkpointId, activityId },
+    });
+    if (!checkpoint?.photoUrl) {
+      throw new NotFoundException('Photo not found');
+    }
+    const buffer = await this.storageService.read(path.basename(checkpoint.photoUrl));
+    res.set('Content-Type', 'image/jpeg');
+    res.send(buffer);
   }
 }

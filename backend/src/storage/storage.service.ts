@@ -4,6 +4,7 @@ import * as path from 'path';
 
 export interface StorageService {
   save(buffer: Buffer, filename: string): Promise<string>;
+  read(filename: string): Promise<Buffer>;
 }
 
 @Injectable()
@@ -15,6 +16,10 @@ export class LocalDiskStorageService implements StorageService {
     const filePath = path.join(this.uploadDir, filename);
     fs.writeFileSync(filePath, buffer);
     return `/uploads/${filename}`;
+  }
+
+  async read(filename: string): Promise<Buffer> {
+    return fs.readFileSync(path.join(this.uploadDir, filename));
   }
 }
 

@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateActivityDto } from './dto/create-activity.dto';
+import { CreateCheckpointDto } from './dto/create-checkpoint.dto';
 import { UpdateActivityDto } from './dto/update-activity.dto';
 
 @Injectable()
@@ -62,5 +63,17 @@ export class ActivitiesService {
     });
 
     return { status: 'updated' as const, activity: updated };
+  }
+
+  async createCheckpoint(userId: string, activityId: string, dto: CreateCheckpointDto) {
+    await this.findOneForUser(userId, activityId); // ownership check; 404s if not this user's
+    return this.prisma.checkpoint.create({
+      data: {
+        activityId,
+        lat: dto.lat,
+        lng: dto.lng,
+        capturedAt: new Date(dto.capturedAt),
+      },
+    });
   }
 }

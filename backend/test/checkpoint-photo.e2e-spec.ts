@@ -42,9 +42,12 @@ describe('Checkpoint photo upload (e2e)', () => {
       .send({ title: 'Trail with a view', startedAt: '2026-09-06T07:00:00.000Z', routePoints: [] });
     const activityId = activityRes.body.id;
 
-    const checkpoint = await prisma.checkpoint.create({
-      data: { activityId, lat: 10.1, lng: 106.1, capturedAt: new Date() },
-    });
+    const checkpointRes = await request(app.getHttpServer())
+      .post(`/activities/${activityId}/checkpoints`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ lat: 10.1, lng: 106.1, capturedAt: new Date().toISOString() });
+    expect(checkpointRes.status).toBe(201);
+    const checkpoint = checkpointRes.body;
 
     const fakeImage = Buffer.from('fake-jpeg-bytes');
     const uploadRes = await request(app.getHttpServer())
@@ -58,5 +61,12 @@ describe('Checkpoint photo upload (e2e)', () => {
     const stored = await prisma.checkpoint.findUnique({ where: { id: checkpoint.id } });
     expect(stored?.photoUrl).toBeTruthy();
     expect(fs.existsSync(path.join(uploadDir, path.basename(stored!.photoUrl!)))).toBe(true);
+
+    const photoRes = await request(app.getHttpServer())
+      .get(`/activities/${activityId}/checkpoints/${checkpoint.id}/photo`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(photoRes.status).toBe(200);
+    expect(Buffer.compare(photoRes.body, fakeImage)).toBe(0);
   });
 });
