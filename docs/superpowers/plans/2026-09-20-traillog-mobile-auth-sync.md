@@ -967,6 +967,13 @@ describe('createSyncEngine', () => {
     // the still-outstanding checkpoint 2 should go up.
     const succeedingApi = fakeApiClient({
       createCheckpoint: jest.fn().mockResolvedValue({ id: 'server-checkpoint-2' }),
+      // The retry finds activity.serverId already set, so pushActivity
+      // takes the "already exists on the server" branch and calls
+      // updateActivityMetadata (harmless re-push) before resuming the
+      // checkpoint loop — this must resolve a real, non-conflict result,
+      // not the fixture's bare default mock (which resolves `undefined`
+      // and made `'conflict' in result` throw).
+      updateActivityMetadata: jest.fn().mockResolvedValue({ id: 'server-1', title: 'Two checkpoints', updatedAt: '2026-09-21T14:00:00.000Z' }),
     });
     const secondSummary = await createSyncEngine(repo, succeedingApi as any).syncNow();
 
