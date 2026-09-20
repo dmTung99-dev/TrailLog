@@ -18,6 +18,13 @@ module.exports = {
   },
   setupFilesAfterEnv: [],
   testEnvironment: 'node',
+  // Jest's default 5000ms timeout is tight enough that the first RN-render
+  // test in a suite reliably times out on a cold transform cache (verified:
+  // deterministic after `jest --clearCache`, not the "transient load" it
+  // was first mistaken for). CI's actions/setup-node cache only covers the
+  // npm download cache, not Jest's own transform cache in os.tmpdir(), so
+  // every CI run is cold -- this would otherwise fail intermittently there.
+  testTimeout: 20000,
   transformIgnorePatterns: [
     'node_modules/(?!(react-native|@react-native|@react-native-async-storage|@react-navigation|@react-native-community|react-native-get-random-values|react-native-permissions|uuid)/)',
   ],
