@@ -4,7 +4,7 @@
 
 **Goal:** Build the NestJS + PostgreSQL backend that stores TrailLog activities, arbitrates sync conflicts, and serves checkpoint photos — testable end-to-end over HTTP with no mobile app involved.
 
-**Architecture:** A single NestJS application with three feature modules (Auth, Activities, Storage) on top of PostgreSQL via Prisma. Every endpoint that reads or writes user data sits behind a JWT guard. Conflict resolution is `updatedAt`-based last-write-wins with an explicit 409 response when both sides changed since the client's last known state — no distributed-sync framework, just one deliberate comparison.
+**Architecture:** A single NestJS application with three feature modules (Auth, Activities, Storage) on top of PostgreSQL via Prisma. Every endpoint that reads or writes user data sits behind a JWT guard. Conflict resolution is `updatedAt`-based last-write-wins: when both sides changed since the client's last known state, `PATCH /activities/:id` responds `200` with `{ conflict: true, serverActivity }` rather than a `409` status — a deliberate choice so a mobile client (not yet written) branches on response body shape, not HTTP status, and the not-yet-written mobile Auth & Sync plan should be written against this exact contract. (An earlier draft of this line said "explicit 409 response"; corrected after the final review caught the mismatch with Task 4's actual shipped code — no `409` status is ever returned by this endpoint.) No distributed-sync framework — just one deliberate timestamp comparison. Auth issues a single long-lived access token with no refresh flow (the original design spec's mention of "refresh tokens" was not implemented in this plan and should be treated as descoped unless a later plan adds it).
 
 **Tech Stack:** NestJS 10, TypeScript (strict), Prisma 5 + PostgreSQL 15, `@nestjs/jwt` + `passport-jwt`, `class-validator`, Jest + Supertest.
 
@@ -1363,8 +1363,156 @@ git commit -m "ci: run lint, build, and tests against a real Postgres service co
 
 ---
 
+### Task 7: Final-review fixes — backend ESLint config, checkpoint creation, and photo retrieval
+
+Added after the final whole-branch review found three gaps invisible to any single task's own review: (1) `backend/` has no ESLint config of its own, so lint silently resolves to the mobile app's React Native config via the monorepo root — works today only because the root's `node_modules` happens to be installed, and would very likely break outright on a clean CI runner; (2) there is no endpoint anywhere to create a `Checkpoint` — Task 5's own e2e test creates one by calling `prisma.checkpoint.create(...)` directly, bypassing the API, so a real client has no way to create one; (3) `LocalDiskStorageService` writes photos to disk and returns a `/uploads/...` URL, but nothing serves that path — the URL is a dead link.
+
+**Files:**
+- Create: `backend/.eslintrc.json`
+- Modify: `backend/package.json` (add `@typescript-eslint/eslint-plugin`/`@typescript-eslint/parser` devDependencies)
+- Modify: `backend/src/storage/storage.service.ts` (add `read` to `StorageService`)
+- Create: `backend/src/activities/dto/create-checkpoint.dto.ts`
+- Modify: `backend/src/activities/activities.service.ts` (add `createCheckpoint`)
+- Modify: `backend/src/activities/activities.controller.ts` (add `POST .../checkpoints` and `GET .../checkpoints/:id/photo`)
+- Test: extend `backend/test/checkpoint-photo.e2e-spec.ts` (create the checkpoint via the new endpoint instead of direct Prisma access; add a retrieval assertion)
+
+**Interfaces:**
+- Consumes: `ActivitiesService.findOneForUser` (Task 3), `STORAGE_SERVICE`/`StorageService` (Task 5).
+- Produces: `ActivitiesService.createCheckpoint(userId, activityId, dto): Promise<Checkpoint>`; `StorageService.read(filename): Promise<Buffer>`.
+
+- [ ] **Step 1: ESLint config**
+
+```json
+// backend/.eslintrc.json
+{
+  "root": true,
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "project": "tsconfig.json",
+    "sourceType": "module"
+  },
+  "plugins": ["@typescript-eslint"],
+  "extends": ["eslint:recommended", "plugin:@typescript-eslint/recommended"],
+  "env": { "node": true, "jest": true },
+  "ignorePatterns": [".eslintrc.js", "dist"]
+}
+```
+
+Add `@typescript-eslint/eslint-plugin` and `@typescript-eslint/parser` to `backend/package.json`'s devDependencies, at whatever version range is actually compatible with the already-installed `eslint@^8.57.0` (verify with a real `npm install` — don't guess a version that turns out incompatible). Run `npm run lint` from `backend/` and confirm it now resolves `backend/.eslintrc.json`, not the root config (`npx eslint --print-config src/app.controller.ts | grep parser` should point at `backend/node_modules`, not the repo root) — this is the exact regression the final review caught, so confirming it's fixed matters more than just "lint exits 0."
+
+- [ ] **Step 2: Checkpoint creation endpoint**
+
+```typescript
+// backend/src/activities/dto/create-checkpoint.dto.ts
+import { IsDateString, IsNumber } from 'class-validator';
+
+export class CreateCheckpointDto {
+  @IsNumber()
+  lat!: number;
+
+  @IsNumber()
+  lng!: number;
+
+  @IsDateString()
+  capturedAt!: string;
+}
+```
+
+```typescript
+// backend/src/activities/activities.service.ts (add to the class)
+import { CreateCheckpointDto } from './dto/create-checkpoint.dto';
+// ...
+
+  async createCheckpoint(userId: string, activityId: string, dto: CreateCheckpointDto) {
+    await this.findOneForUser(userId, activityId); // ownership check; 404s if not this user's
+    return this.prisma.checkpoint.create({
+      data: {
+        activityId,
+        lat: dto.lat,
+        lng: dto.lng,
+        capturedAt: new Date(dto.capturedAt),
+      },
+    });
+  }
+```
+
+```typescript
+// backend/src/activities/activities.controller.ts (add import + endpoint)
+import { CreateCheckpointDto } from './dto/create-checkpoint.dto';
+// ...inside ActivitiesController:
+
+  @Post(':activityId/checkpoints')
+  createCheckpoint(
+    @Req() req: AuthedRequest,
+    @Param('activityId') activityId: string,
+    @Body() dto: CreateCheckpointDto,
+  ) {
+    return this.activitiesService.createCheckpoint(req.user.userId, activityId, dto);
+  }
+```
+
+- [ ] **Step 3: Checkpoint photo retrieval**
+
+```typescript
+// backend/src/storage/storage.service.ts (extend the interface and implementation)
+export interface StorageService {
+  save(buffer: Buffer, filename: string): Promise<string>;
+  read(filename: string): Promise<Buffer>;
+}
+
+// inside LocalDiskStorageService, add:
+  async read(filename: string): Promise<Buffer> {
+    return fs.readFileSync(path.join(this.uploadDir, filename));
+  }
+```
+
+```typescript
+// backend/src/activities/activities.controller.ts (add import + endpoint)
+import { Get, Res } from '@nestjs/common';
+import type { Response } from 'express';
+import * as path from 'path';
+// ...inside ActivitiesController:
+
+  @Get(':activityId/checkpoints/:checkpointId/photo')
+  async getCheckpointPhoto(
+    @Req() req: AuthedRequest,
+    @Param('activityId') activityId: string,
+    @Param('checkpointId') checkpointId: string,
+    @Res() res: Response,
+  ) {
+    await this.activitiesService.findOneForUser(req.user.userId, activityId); // ownership check
+    const checkpoint = await this.prisma.checkpoint.findFirst({
+      where: { id: checkpointId, activityId },
+    });
+    if (!checkpoint?.photoUrl) {
+      throw new NotFoundException('Photo not found');
+    }
+    const buffer = await this.storageService.read(path.basename(checkpoint.photoUrl));
+    res.set('Content-Type', 'image/jpeg');
+    res.send(buffer);
+  }
+```
+
+This is an authenticated, ownership-checked route rather than an unauthenticated static file mount — checkpoint photos are private user data, consistent with every other route in this controller.
+
+- [ ] **Step 4: Update the e2e test to exercise the real API end to end**
+
+Rewrite `backend/test/checkpoint-photo.e2e-spec.ts`'s checkpoint creation to go through `POST /activities/:id/checkpoints` instead of `prisma.checkpoint.create(...)` directly, and add an assertion that `GET /activities/:id/checkpoints/:checkpointId/photo` (after the upload) returns 200 with the same bytes that were uploaded (`Buffer.compare` against the original `fakeImage`). This closes the exact gap the final review found: the old test's use of direct Prisma access meant the creation endpoint's absence, and the missing retrieval route, were both invisible to it.
+
+- [ ] **Step 5: Verify and commit**
+
+Run `npm ci --no-audit --no-fund && npm run lint && npm run build && npm test && npm run test:e2e` from `backend/`. All must pass, including the rewritten e2e test's new assertions.
+
+```bash
+git add backend/.eslintrc.json backend/package.json backend/package-lock.json backend/src/storage/storage.service.ts backend/src/activities/dto/create-checkpoint.dto.ts backend/src/activities/activities.service.ts backend/src/activities/activities.controller.ts backend/test/checkpoint-photo.e2e-spec.ts
+git commit -m "fix: add backend ESLint config, checkpoint creation endpoint, and photo retrieval"
+```
+
+---
+
 ## Self-Review Notes
 
-- **Spec coverage:** Auth ✅ (Task 2), Activities CRUD ✅ (Task 3), conflict resolution ✅ (Task 4), checkpoint photo storage behind a pluggable interface ✅ (Task 5), CI ✅ (Task 6). Cross-device sync consumption of this API is out of scope here by design — it belongs to the mobile Auth & Sync plan.
+- **Spec coverage:** Auth ✅ (Task 2), Activities CRUD ✅ (Task 3), conflict resolution ✅ (Task 4), checkpoint photo storage behind a pluggable interface ✅ (Task 5), CI ✅ (Task 6), checkpoint creation + retrieval + backend-scoped lint ✅ (Task 7, added after final review). Cross-device sync consumption of this API is out of scope here by design — it belongs to the mobile Auth & Sync plan.
 - **Placeholder scan:** none found; the one caveat note in Task 5 (Multer memory storage) is a documented fallback with an exact fix, not a TODO.
-- **Type consistency:** `updateMetadata`'s `{ status: 'updated' | 'conflict' }` shape is used identically in its unit test (Task 4) and its controller caller (Task 4); `STORAGE_SERVICE`/`StorageService` introduced in Task 5 are the only names the checkpoint-photo endpoint uses.
+- **Type consistency:** `updateMetadata`'s `{ status: 'updated' | 'conflict' }` shape is used identically in its unit test (Task 4) and its controller caller (Task 4); `STORAGE_SERVICE`/`StorageService` introduced in Task 5 are the only names the checkpoint-photo endpoints use, and Task 7's `read` addition to the same interface is used only by the new retrieval route.
+- **Known, deliberately deferred (not fixed in this plan):** the design spec's "explicit 409 response" for conflicts doesn't match the shipped `200` + `{ conflict: true, serverActivity }` body (Task 4) — kept as shipped since a real 409 would be a breaking change to write against once a mobile client exists; the design spec's "refresh tokens" aren't implemented (Task 2 issues only a 7-day access token). Both are noted in the design spec directly rather than fixed here. Also deferred: JWT_SECRET fail-fast validation, checkpoint photo upload size/MIME limits, an `Activity.userId` foreign key + index, `UpdateActivityDto.visibility` enum validation, and a `paths: ['backend/**']` filter on the CI trigger — none of these block using this API, and are recommended as one follow-up hardening task before this backend is ever internet-facing.
