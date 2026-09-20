@@ -129,10 +129,16 @@ export function createActivitiesRepository(db: SqlDatabase): ActivitiesRepositor
     async updateActivityMetadata(activityId, changes) {
       const now = new Date().toISOString();
       if (changes.title !== undefined) {
-        await db.executeSql('UPDATE activities SET title = ?, updated_at = ? WHERE id = ?', [changes.title, now, activityId]);
+        await db.executeSql(
+          "UPDATE activities SET title = ?, sync_status = 'pending', updated_at = ? WHERE id = ?",
+          [changes.title, now, activityId],
+        );
       }
       if (changes.notes !== undefined) {
-        await db.executeSql('UPDATE activities SET notes = ?, updated_at = ? WHERE id = ?', [changes.notes, now, activityId]);
+        await db.executeSql(
+          "UPDATE activities SET notes = ?, sync_status = 'pending', updated_at = ? WHERE id = ?",
+          [changes.notes, now, activityId],
+        );
       }
     },
 

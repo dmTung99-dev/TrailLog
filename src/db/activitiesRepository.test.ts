@@ -86,6 +86,23 @@ describe('sync-related repository methods', () => {
     expect(JSON.parse(activity!.conflictServerActivity!)).toMatchObject({ title: 'Renamed on phone B' });
   });
 
+  it('moves a synced activity back to pending when its metadata is edited locally, so it is re-synced', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+
+    const activityId = await repo.createActivity({ title: 'Already synced once', startedAt: '2026-09-21T11:00:00.000Z' });
+    await repo.markActivitySynced(activityId, 'server-2', '2026-09-21T11:00:00.000Z');
+
+    await repo.updateActivityMetadata(activityId, { title: 'Renamed on this phone' });
+
+    const activity = await repo.getActivity(activityId);
+    expect(activity?.syncStatus).toBe('pending');
+
+    const pending = await repo.listPendingActivities();
+    expect(pending.map((a) => a.id)).toContain(activityId);
+  });
+
   it('marks a checkpoint synced, then its photo uploaded, independently', async () => {
     const db = createBetterSqliteAdapter();
     await initSchema(db);
