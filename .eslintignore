@@ -1,0 +1,11 @@
+# backend/ is a separate NestJS project with its own .eslintrc.json and
+# lint script, run via `npm run lint` from inside backend/ (see its own
+# package.json and .github/workflows/backend-ci.yml). The mobile app's
+# root `eslint . --ext .ts,.tsx` must never walk into it: doing so used to
+# silently resolve backend's files against the mobile app's React Native
+# config (harmless-looking, but fragile - see the backend plan's final
+# review), and after backend/tsconfig.json was correctly excluded from the
+# root tsconfig.json, it started erroring outright instead, since
+# backend/.eslintrc.json's parserOptions.project resolves relative to the
+# ESLint process's cwd, not the config file's location.
+backend/
