@@ -6,6 +6,8 @@ module.exports = {
     '^react-native-geolocation-service$': '<rootDir>/src/__mocks__/react-native-geolocation-service.js',
     '^react-native-background-actions$': '<rootDir>/src/__mocks__/react-native-background-actions.js',
     '^react-native-sensors$': '<rootDir>/src/__mocks__/react-native-sensors.js',
+    '^react-native-vision-camera$': '<rootDir>/src/__mocks__/react-native-vision-camera.js',
+    '^react-native-maps$': '<rootDir>/src/__mocks__/react-native-maps.js',
   },
   setupFilesAfterEnv: [],
   testEnvironment: 'node',
