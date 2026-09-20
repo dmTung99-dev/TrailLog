@@ -8,27 +8,59 @@ export interface SyncSummary {
 }
 
 export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClient) {
-  async function pushNewActivity(activity: Activity): Promise<'synced' | 'failed'> {
+  async function pushActivity(activity: Activity): Promise<'synced' | 'conflict' | 'failed'> {
     try {
-      const server = await apiClient.createActivity({
-        title: activity.title,
-        notes: activity.notes ?? undefined,
-        startedAt: activity.startedAt,
-        endedAt: activity.endedAt ?? undefined,
-        routePoints: activity.routePoints.map((p) => ({ lat: p.lat, lng: p.lng, recordedAt: p.recordedAt, sequence: p.sequence })),
-      });
-      await repo.markActivitySynced(activity.id, server.id, server.updatedAt);
+      let serverId = activity.serverId;
+      let serverUpdatedAt = activity.updatedAt;
 
-      for (const checkpoint of activity.checkpoints) {
-        const serverCheckpoint = await apiClient.createCheckpoint(server.id, {
-          lat: checkpoint.lat,
-          lng: checkpoint.lng,
-          capturedAt: checkpoint.capturedAt,
+      if (!serverId) {
+        // Never reached the server at all yet — full create.
+        const server = await apiClient.createActivity({
+          title: activity.title,
+          notes: activity.notes ?? undefined,
+          startedAt: activity.startedAt,
+          endedAt: activity.endedAt ?? undefined,
+          routePoints: activity.routePoints.map((p) => ({ lat: p.lat, lng: p.lng, recordedAt: p.recordedAt, sequence: p.sequence })),
         });
-        await repo.markCheckpointSynced(checkpoint.id, serverCheckpoint.id);
+        serverId = server.id;
+        serverUpdatedAt = server.updatedAt;
+        await repo.markActivityServerId(activity.id, serverId);
+      } else {
+        // Already exists on the server — either resuming a sync that was
+        // interrupted before its checkpoints finished, or this is a
+        // genuine local metadata edit after a prior full sync. Push the
+        // current local title/notes either way; harmless if nothing
+        // changed since the server's last copy.
+        const result = await apiClient.updateActivityMetadata(serverId, {
+          title: activity.title,
+          notes: activity.notes ?? undefined,
+          clientUpdatedAt: activity.updatedAt,
+        });
 
-        if (checkpoint.photoPath) {
-          await apiClient.uploadCheckpointPhoto(server.id, serverCheckpoint.id, {
+        if ('conflict' in result) {
+          await repo.markActivityConflict(activity.id, JSON.stringify(result.serverActivity));
+          return 'conflict';
+        }
+        serverUpdatedAt = result.updatedAt;
+      }
+
+      // Idempotent on purpose: skip any checkpoint/photo that already
+      // reached the server on an earlier, interrupted attempt, so retrying
+      // a partially-synced activity never re-creates a checkpoint.
+      for (const checkpoint of activity.checkpoints) {
+        let serverCheckpointId = checkpoint.serverId;
+        if (!serverCheckpointId) {
+          const serverCheckpoint = await apiClient.createCheckpoint(serverId, {
+            lat: checkpoint.lat,
+            lng: checkpoint.lng,
+            capturedAt: checkpoint.capturedAt,
+          });
+          serverCheckpointId = serverCheckpoint.id;
+          await repo.markCheckpointSynced(checkpoint.id, serverCheckpointId);
+        }
+
+        if (checkpoint.photoPath && !checkpoint.photoUploaded) {
+          await apiClient.uploadCheckpointPhoto(serverId, serverCheckpointId, {
             uri: checkpoint.photoPath,
             name: `${checkpoint.id}.jpg`,
             type: 'image/jpeg',
@@ -37,27 +69,10 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         }
       }
 
-      return 'synced';
-    } catch {
-      return 'failed';
-    }
-  }
-
-  async function pushMetadataEdit(activity: Activity): Promise<'synced' | 'conflict' | 'failed'> {
-    if (!activity.serverId) return 'failed';
-    try {
-      const result = await apiClient.updateActivityMetadata(activity.serverId, {
-        title: activity.title,
-        notes: activity.notes ?? undefined,
-        clientUpdatedAt: activity.updatedAt,
-      });
-
-      if ('conflict' in result) {
-        await repo.markActivityConflict(activity.id, JSON.stringify(result.serverActivity));
-        return 'conflict';
-      }
-
-      await repo.markActivitySynced(activity.id, result.id, result.updatedAt);
+      // Only now — the activity itself AND every checkpoint AND every
+      // photo are all confirmed on the server — is this activity actually
+      // fully synced and safe to drop from listPendingActivities().
+      await repo.markActivitySynced(activity.id, serverId, serverUpdatedAt);
       return 'synced';
     } catch {
       return 'failed';
@@ -70,7 +85,7 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
       const pending = await repo.listPendingActivities();
 
       for (const activity of pending) {
-        const outcome = activity.serverId ? await pushMetadataEdit(activity) : await pushNewActivity(activity);
+        const outcome = await pushActivity(activity);
 
         if (outcome === 'synced') summary.synced += 1;
         else if (outcome === 'conflict') summary.conflicts += 1;

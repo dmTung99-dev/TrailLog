@@ -39,6 +39,7 @@ export interface ActivitiesRepository {
   updateActivityMetadata(activityId: string, changes: { title?: string; notes?: string }): Promise<void>;
   listPendingActivities(): Promise<Activity[]>;
   markActivitySynced(activityId: string, serverId: string, serverUpdatedAt: string): Promise<void>;
+  markActivityServerId(activityId: string, serverId: string): Promise<void>;
   markActivityConflict(activityId: string, serverActivityJson: string): Promise<void>;
   markCheckpointSynced(checkpointId: string, serverId: string): Promise<void>;
   markCheckpointPhotoUploaded(checkpointId: string): Promise<void>;
@@ -152,6 +153,14 @@ export function createActivitiesRepository(db: SqlDatabase): ActivitiesRepositor
         "UPDATE activities SET server_id = ?, sync_status = 'synced', updated_at = ? WHERE id = ?",
         [serverId, serverUpdatedAt, activityId],
       );
+    },
+
+    async markActivityServerId(activityId, serverId) {
+      // Deliberately does NOT touch sync_status — the activity stays
+      // 'pending' (visible to listPendingActivities()) until the sync
+      // engine has also finished pushing every checkpoint and photo. See
+      // the design note after Step 4 for why this split matters.
+      await db.executeSql('UPDATE activities SET server_id = ? WHERE id = ?', [serverId, activityId]);
     },
 
     async markActivityConflict(activityId, serverActivityJson) {

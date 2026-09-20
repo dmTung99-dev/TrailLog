@@ -118,4 +118,53 @@ describe('createSyncEngine', () => {
     expect(activity?.title).toBe('Renamed on this phone'); // never silently overwritten
     expect(JSON.parse(activity!.conflictServerActivity!).title).toBe('Renamed on the other phone');
   });
+
+  it('resumes a partially-synced activity on retry instead of re-creating it or losing remaining checkpoints', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+    const activityId = await repo.createActivity({ title: 'Two checkpoints', startedAt: '2026-09-21T13:00:00.000Z' });
+    const checkpoint1Id = await repo.addCheckpoint(activityId, { lat: 10.4, lng: 106.4, capturedAt: '2026-09-21T13:05:00.000Z' });
+    const checkpoint2Id = await repo.addCheckpoint(activityId, { lat: 10.5, lng: 106.5, capturedAt: '2026-09-21T13:10:00.000Z' });
+
+    // First attempt: the activity itself and checkpoint 1 succeed;
+    // checkpoint 2's creation fails partway (simulating a dropped
+    // connection mid-sync).
+    const failingApi = fakeApiClient({
+      createCheckpoint: jest
+        .fn()
+        .mockResolvedValueOnce({ id: 'server-checkpoint-1' })
+        .mockRejectedValueOnce(new Error('network dropped')),
+    });
+    const firstSummary = await createSyncEngine(repo, failingApi as any).syncNow();
+
+    expect(firstSummary).toEqual({ synced: 0, conflicts: 0, failed: 1 });
+
+    let activity = await repo.getActivity(activityId);
+    expect(activity?.syncStatus).toBe('pending'); // must still be retryable, not silently lost
+    expect(activity?.serverId).toBe('server-1'); // the activity itself was created
+    expect(activity?.checkpoints.find((c) => c.id === checkpoint1Id)?.serverId).toBe('server-checkpoint-1'); // survived
+
+    // Second attempt: everything succeeds. The activity must NOT be
+    // re-created, and checkpoint 1 must NOT be re-created either — only
+    // the still-outstanding checkpoint 2 should go up.
+    const succeedingApi = fakeApiClient({
+      // The activity already has a serverId from the first attempt, so this
+      // retry takes pushActivity's "already exists on the server" branch,
+      // which re-pushes metadata via updateActivityMetadata (harmless/
+      // idempotent per the design note) rather than calling createActivity.
+      updateActivityMetadata: jest.fn().mockResolvedValue({ id: 'server-1', title: 'Two checkpoints', updatedAt: '2026-09-21T14:00:00.000Z' }),
+      createCheckpoint: jest.fn().mockResolvedValue({ id: 'server-checkpoint-2' }),
+    });
+    const secondSummary = await createSyncEngine(repo, succeedingApi as any).syncNow();
+
+    expect(secondSummary).toEqual({ synced: 1, conflicts: 0, failed: 0 });
+    expect(succeedingApi.createActivity).not.toHaveBeenCalled();
+    expect(succeedingApi.createCheckpoint).toHaveBeenCalledTimes(1);
+    expect(succeedingApi.createCheckpoint).toHaveBeenCalledWith('server-1', expect.objectContaining({ lat: 10.5, lng: 106.5 }));
+
+    activity = await repo.getActivity(activityId);
+    expect(activity?.syncStatus).toBe('synced');
+    expect(activity?.checkpoints.find((c) => c.id === checkpoint2Id)?.serverId).toBe('server-checkpoint-2');
+  });
 });
