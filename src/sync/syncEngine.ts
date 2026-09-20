@@ -12,7 +12,7 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
     try {
       let serverId = activity.serverId;
       let serverUpdatedAt = activity.updatedAt;
-      let hadConflict = false;
+      let conflictPayload: string | null = null;
 
       if (!serverId) {
         // Never reached the server at all yet — full create.
@@ -41,12 +41,16 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         });
 
         if ('conflict' in result) {
-          // Record the conflict, but do NOT return yet: checkpoints/photos
-          // are independent of the metadata dispute and must not be
-          // abandoned just because title/notes collided. See the second
-          // design note after this function.
-          await repo.markActivityConflict(activity.id, JSON.stringify(result.serverActivity));
-          hadConflict = true;
+          // Hold the conflict payload rather than writing it now: like
+          // markActivitySynced, markActivityConflict's write removes this
+          // activity from listPendingActivities() (any non-'pending'
+          // status does) — committing it here, before the checkpoint loop
+          // below has run, would repeat the exact bug this task was fixed
+          // for twice already, just via a third status value. The actual
+          // repo.markActivityConflict call happens after the loop, right
+          // before returning 'conflict'. See the third design note after
+          // this function.
+          conflictPayload = JSON.stringify(result.serverActivity);
         } else {
           serverUpdatedAt = result.updatedAt;
         }
@@ -78,13 +82,15 @@ export function createSyncEngine(repo: ActivitiesRepository, apiClient: ApiClien
         }
       }
 
-      if (hadConflict) {
+      // Only now — every checkpoint/photo in this pass has actually
+      // reached the server (the loop above would have thrown otherwise,
+      // leaving sync_status untouched at 'pending') — is it safe to write
+      // a terminal, queue-removing status at all.
+      if (conflictPayload) {
+        await repo.markActivityConflict(activity.id, conflictPayload);
         return 'conflict';
       }
 
-      // Only now — the activity itself AND every checkpoint AND every
-      // photo are all confirmed on the server — is this activity actually
-      // fully synced and safe to drop from listPendingActivities().
       await repo.markActivitySynced(activity.id, serverId, serverUpdatedAt);
       return 'synced';
     } catch {

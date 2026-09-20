@@ -195,4 +195,35 @@ describe('createSyncEngine', () => {
     expect(activity?.syncStatus).toBe('conflict'); // metadata conflict still surfaced to the user
     expect(activity?.checkpoints.find((c) => c.id === checkpointId)?.serverId).toBe('server-checkpoint-3'); // but the checkpoint made it up anyway
   });
+
+  it('leaves an activity pending, not conflict, if a checkpoint fails in the same pass as a metadata conflict', async () => {
+    const db = createBetterSqliteAdapter();
+    await initSchema(db);
+    const repo = createActivitiesRepository(db);
+    const activityId = await repo.createActivity({ title: 'Conflict plus failure', startedAt: '2026-09-21T17:00:00.000Z' });
+    await repo.addCheckpoint(activityId, { lat: 10.7, lng: 106.7, capturedAt: '2026-09-21T17:05:00.000Z' });
+    await repo.markActivityServerId(activityId, 'server-4', '2026-09-21T17:00:00.000Z');
+
+    const api = fakeApiClient({
+      updateActivityMetadata: jest.fn().mockResolvedValue({
+        conflict: true,
+        serverActivity: { id: 'server-4', title: 'Renamed elsewhere', updatedAt: '2026-09-21T18:00:00.000Z' },
+      }),
+      createCheckpoint: jest.fn().mockRejectedValue(new Error('network dropped')),
+    });
+    const summary = await createSyncEngine(repo, api as any).syncNow();
+
+    expect(summary).toEqual({ synced: 0, conflicts: 0, failed: 1 });
+
+    const activity = await repo.getActivity(activityId);
+    // The conflict must NOT have been committed -- it was only ever held
+    // in memory pending the checkpoint loop, which then threw. The
+    // activity stays exactly as it was before this attempt: 'pending',
+    // no conflict snapshot, still retryable on the next syncNow().
+    expect(activity?.syncStatus).toBe('pending');
+    expect(activity?.conflictServerActivity).toBeNull();
+
+    const pending = await repo.listPendingActivities();
+    expect(pending.map((a) => a.id)).toContain(activityId);
+  });
 });
