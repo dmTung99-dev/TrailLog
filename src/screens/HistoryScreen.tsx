@@ -38,11 +38,17 @@ export function HistoryScreen() {
         data={activities}
         keyExtractor={(item) => item.id}
         renderItem={({ item }) => (
-          <TouchableOpacity onPress={() => navigation.navigate('ActivitySummary', { activityId: item.id })}>
-            <View>
+          <View>
+            <TouchableOpacity onPress={() => navigation.navigate('ActivitySummary', { activityId: item.id })}>
               <Text>{item.title}</Text>
-            </View>
-          </TouchableOpacity>
+            </TouchableOpacity>
+            <Text>
+              {item.syncStatus === 'conflict' ? 'Conflict' : item.syncStatus === 'pending' ? 'Not synced' : 'Synced'}
+            </Text>
+            {item.syncStatus === 'conflict' && (
+              <Button title="Resolve" onPress={() => navigation.navigate('ConflictResolution', { activityId: item.id })} />
+            )}
+          </View>
         )}
       />
     </View>

@@ -43,4 +43,24 @@ describe('HistoryScreen', () => {
 
     await waitFor(() => expect(screen.getByText('Synced 2, 1 conflict')).toBeTruthy());
   });
+
+  it('shows a Resolve button only for a conflicted activity, navigating to ConflictResolution', async () => {
+    const navigate = jest.fn();
+    (useNavigation as jest.Mock).mockReturnValue({ navigate });
+    jest.spyOn(repoModule, 'createActivitiesRepository').mockReturnValue({
+      listActivities: jest.fn().mockResolvedValue([
+        { id: '1', title: 'Conflicted hike', startedAt: '2026-09-21T07:00:00.000Z', syncStatus: 'conflict', routePoints: [], checkpoints: [] },
+        { id: '2', title: 'Synced walk', startedAt: '2026-09-20T18:00:00.000Z', syncStatus: 'synced', routePoints: [], checkpoints: [] },
+      ]),
+    } as any);
+
+    render(<HistoryScreen />);
+    await waitFor(() => expect(screen.getByText('Conflicted hike')).toBeTruthy());
+
+    // Only the conflicted row gets a Resolve button.
+    expect(screen.getAllByText('Resolve')).toHaveLength(1);
+
+    fireEvent.press(screen.getByText('Resolve'));
+    expect(navigate).toHaveBeenCalledWith('ConflictResolution', { activityId: '1' });
+  });
 });
