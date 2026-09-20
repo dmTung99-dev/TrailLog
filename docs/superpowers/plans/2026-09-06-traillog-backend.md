@@ -42,7 +42,7 @@
 // test/health.e2e-spec.ts
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
-import * as request from 'supertest';
+import request from 'supertest';
 import { AppModule } from '../src/app.module';
 
 describe('Health (e2e)', () => {
@@ -251,7 +251,7 @@ git commit -m "feat: scaffold NestJS app with a health check endpoint"
 // test/auth.e2e-spec.ts
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
-import * as request from 'supertest';
+import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
 
@@ -607,7 +607,7 @@ git commit -m "feat: add Postgres/Prisma and JWT-based register/login"
 // test/activities.e2e-spec.ts
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
-import * as request from 'supertest';
+import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
 
@@ -1114,7 +1114,7 @@ git commit -m "feat: add last-write-wins conflict detection to activity metadata
 // test/checkpoint-photo.e2e-spec.ts
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
-import * as request from 'supertest';
+import request from 'supertest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
