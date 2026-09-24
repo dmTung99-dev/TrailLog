@@ -969,7 +969,7 @@ providers: [{ provide: STORAGE_SERVICE, useClass: LocalDiskStorageService }]
 3. Không có bước đăng nhập, trong khi app mở vào màn Login nếu chưa có token.
 4. CI chạy nó trên `macos-14` (Apple Silicon) — chạy Android emulator trên runner này là điểm **cần kiểm chứng**.
 
-**CI** (`.github/workflows/mobile-ci.yml`, `backend-ci.yml`): lint + typecheck + test cho mobile; lint + build + unit + e2e (Postgres thật) cho backend; Detox chỉ chạy khi `workflow_dispatch` (thủ công) — đúng tinh thần "e2e tốn emulator nên chạy riêng". **Nhưng:** cả hai workflow trigger khi push lên nhánh **`main`** (và PR), trong khi repo làm việc trên **`master`** và **chưa có remote** (`git remote -v` rỗng) → **CI chưa từng chạy** (bẫy số 5 ở 1.13).
+**CI** (`.github/workflows/mobile-ci.yml`, `backend-ci.yml`): lint + typecheck + test cho mobile; lint + build + unit + e2e (Postgres thật) cho backend; Detox chỉ chạy khi `workflow_dispatch` (thủ công) — đúng tinh thần "e2e tốn emulator nên chạy riêng". Ban đầu cả hai workflow trigger trên nhánh `main` trong khi repo làm việc trên `master` và chưa có remote → CI chưa từng chạy (đúng bẫy số 5 ở 1.13). Đã sửa: repo được push lên GitHub (`dmTung99-dev/TrailLog`) và trigger đổi sang `master` (cùng PR). Nếu bị hỏi, nói rõ đây là lỗi cấu hình đã phát hiện và sửa, và kiểm tab Actions trước khi khẳng định CI xanh.
 
 **Quy trình:** mọi tính năng đi qua plan trong `docs/superpowers/plans/` + TDD + review; git log cho thấy mẫu lặp lại "docs: sửa plan" → "fix: sửa code" sau mỗi vòng review — bằng chứng review đã bắt được bug thật (3 vòng SyncEngine, 3 vòng keep-alive Android, bug cửa sổ trượt của pedometer).
 
@@ -988,7 +988,7 @@ providers: [{ provide: STORAGE_SERVICE, useClass: LocalDiskStorageService }]
 | Design spec: "Stop → đánh dấu hoàn tất, đưa vào hàng đợi" | Không ghi `ended_at`; hoạt động `pending` ngay từ lúc tạo (§2.4) | *"Đây là lỗ hổng thật: thời điểm kết thúc chưa được lưu."* |
 | Design spec: cảnh báo khi chỉ có vị trí gần đúng | Không có cảnh báo; mọi từ chối quyền đều im lặng (§2.9) | Nói thẳng là chưa làm. |
 | Design spec: đăng nhập email/mật khẩu với màn Login/Register | Có màn, nhưng đăng nhập xong **không tự chuyển màn**, không có đường tới Register, không có Logout (§2.3) | *"Auth gate dùng `initialRouteName` — cần chuyển sang điều kiện hoá cây màn."* |
-| CI "chạy trên mỗi push" | Trigger nhánh `main`, repo đang ở `master`, chưa có remote → chưa chạy lần nào (§2.13) | *"Workflow đã viết, chưa được kích hoạt."* |
+| CI "chạy trên mỗi push" | Ban đầu trigger nhánh `main` trong khi repo dùng `master` và chưa có remote; đã sửa sang `master` (§2.13) | *"Có một lỗi cấu hình trigger, đã sửa; xem tab Actions để biết kết quả thật."* |
 | Detox e2e bao phủ critical path | Chưa chạy được + assert sai màn + thiếu bước đăng nhập (§2.13) | *"Kịch bản đã viết, cần sửa và chạy khi có project native."* |
 | (Ngầm hiểu) `API_BASE_URL` dùng được | `http://localhost:3000` không tới được backend từ emulator/máy thật (§2.11) | Nêu như một việc cấu hình còn thiếu. |
 
@@ -1008,6 +1008,6 @@ providers: [{ provide: STORAGE_SERVICE, useClass: LocalDiskStorageService }]
 - [ ] **NestJS:** thứ tự Guard → Pipe → Handler; `whitelist` + `@Type` cho DTO lồng; vì sao `STORAGE_SERVICE` phải là `Symbol`.
 - [ ] **Auth:** bcrypt vs SHA-256; JWT stateless và nhược điểm thu hồi; **nói trước** 4 lỗ hổng: secret mặc định, không refresh token, AsyncStorage không mã hoá, timing enumeration.
 - [ ] **Prisma:** nested write trong một transaction; ownership check trả 404; `Activity.userId` thiếu `@relation`.
-- [ ] **Testing/CI:** real-SQL fake vs mock; mock native qua `moduleNameMapper` và giới hạn của nó; e2e backend với Postgres thật + rủi ro chạy song song; vì sao Detox và CI chưa chạy thật.
+- [ ] **Testing/CI:** real-SQL fake vs mock; mock native qua `moduleNameMapper` và giới hạn của nó; e2e backend với Postgres thật + rủi ro chạy song song; vì sao Detox chưa chạy thật, và lỗi trigger CI (`main` vs `master`) đã sửa thế nào.
 - [ ] **So sánh RN vs Flutter** (lý do tồn tại của dự án): Bridge/JSI vs platform channel; Hermes (JS) vs AOT Dart; `useEffect` vs `initState/dispose`; vấn đề chạy nền của OS **giống nhau** ở cả hai.
-- [ ] **Trung thực về giới hạn:** nói được (không né) — chưa build trên thiết bị, sync chỉ một chiều, xung đột thực chất là LWW, CI chưa kích hoạt.
+- [ ] **Trung thực về giới hạn:** nói được (không né) — chưa build trên thiết bị, sync chỉ một chiều, xung đột thực chất là LWW.

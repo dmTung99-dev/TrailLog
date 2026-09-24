@@ -147,4 +147,3 @@ This is an honest list of what isn't done yet:
   - A `401` response doesn't sign the user out.
 - **Navigation gaps:** logging in doesn't navigate away from the Login screen, and there is no link to Register and no logout button.
 - **Local-disk photo storage.** The design calls for S3-compatible storage.
-- **CI only triggers on the `main` branch.**
