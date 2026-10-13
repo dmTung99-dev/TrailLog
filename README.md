@@ -4,7 +4,7 @@ An offline-first outdoor activity tracker. It records GPS routes for walks, runs
 
 The project is a **React Native + NestJS** monorepo. It was built to learn React Native in depth coming from Flutter, and it focuses on the parts where the two platforms differ most: background location, native modules, and local-first data sync.
 
-> **Status: work in progress.** The TypeScript layers (tracking logic, local database, sync engine, screens, backend API) are implemented and covered by tests. The native `android/` and `ios/` projects are **not generated yet**. Those folders contain only the manifest/plist entries the app needs. Until `npx react-native init` output is merged in, the app can't be built or run on a device or emulator. See [Known limitations](#known-limitations).
+> **Status: work in progress.** The TypeScript layers (tracking logic, local database, sync engine, screens, backend API) are implemented and covered by tests. The Android app builds (`local` and `staging` variants) but hasn't been exercised on a physical device yet; the iOS project is configured but hasn't been built (no Mac in the loop). See [Known limitations](#known-limitations).
 
 ## Features
 
@@ -42,7 +42,7 @@ The project is a **React Native + NestJS** monorepo. It was built to learn React
 │   └── screens/             # Home, Tracking, History, Summary, Login, Register, ConflictResolution
 ├── test/support/            # better-sqlite3 adapter used as a real-SQL test double
 ├── e2e/                     # Detox end-to-end spec
-├── android/, ios/           # Placeholder native config (not buildable yet)
+├── android/, ios/           # Native projects (Android: local/staging flavors)
 ├── backend/                 # NestJS API (see below)
 └── docs/                    # Design spec, implementation plans, knowledge spec
 ```
@@ -74,23 +74,56 @@ Deeper write-ups:
 ### Prerequisites
 
 - Node.js 20+
-- Docker (for the local PostgreSQL)
-- For running the app later: a React Native environment (Android Studio / Xcode) and generated native projects
+- Docker Desktop (for the local environment)
+- For the app: Android Studio with the Android SDK and JDK 17+ (Xcode on a Mac for iOS)
 
-### Backend
+## Environments
+
+| | Local | Staging |
+|---|---|---|
+| Purpose | Develop and test on your home network | Test against a real public HTTPS URL |
+| API | Docker on your PC, `http://<PC LAN IP>:3000` | [Render](https://render.com) free web service (`render.yaml`) |
+| Database | Postgres 15 in Docker | [Neon](https://neon.com) free Postgres |
+| Photos | Local disk (`STORAGE_DRIVER=local`) | [Cloudflare R2](https://developers.cloudflare.com/r2/) (`STORAGE_DRIVER=s3`) |
+| Cost | $0 | $0 (optional custom domain ≈ $10/year) |
+
+The server validates its environment at startup (`backend/src/config/env.validation.ts`). It refuses to boot without `DATABASE_URL` and `JWT_SECRET`, with an incomplete S3 config, or with the `.env.example` placeholder secret in production.
+
+### Local
 
 ```bash
 cd backend
-cp .env.example .env            # DATABASE_URL and JWT_SECRET
-docker compose up -d            # PostgreSQL 15 on localhost:5432
-npm install
-npx prisma migrate deploy       # apply migrations
-npm run start:dev               # http://localhost:3000
+cp .env.example .env              # set JWT_SECRET to any value
+docker compose up -d --build      # Postgres + API, migrations applied on boot
+curl http://localhost:3000/health # {"status":"ok"}
 ```
 
-Check it's up: `curl http://localhost:3000/health` → `{"status":"ok"}`.
+To test from a phone on the same Wi-Fi, use `http://<your PC's LAN IP>:3000` (find it with `ipconfig`), and allow inbound TCP 3000 in Windows Firewall:
 
-> Always set `JWT_SECRET` to a long random value. If it's missing, the server falls back to a placeholder string.
+```powershell
+New-NetFirewallRule -DisplayName "TrailLog API (dev)" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow -Profile Private
+```
+
+For backend development with hot reload, run only the database in Docker and the API on the host:
+
+```bash
+docker compose up -d postgres
+npm install
+npx prisma migrate deploy
+npm run start:dev
+```
+
+### Staging
+
+One-time setup:
+
+1. **Neon:** create a project in the Singapore region (`aws-ap-southeast-1`) and copy its connection string (`...?sslmode=require`).
+2. **Cloudflare R2:** create a bucket named `traillog-staging`, plus an R2 API token with Object Read & Write on that bucket. Note the S3 endpoint `https://<account-id>.r2.cloudflarestorage.com`, the access key ID, and the secret.
+3. **Render:** New → Blueprint → select this repo. Render reads `render.yaml` and asks for `DATABASE_URL`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`. `JWT_SECRET` is generated automatically.
+
+After that, every push to `master` that touches `backend/` deploys once the GitHub Actions checks pass. The API is served at `https://traillog-api-staging.onrender.com`; a custom domain can be added later under the service's Settings → Custom Domains.
+
+Free-tier behaviour to expect: the API sleeps after 15 minutes without requests and takes about a minute to wake up, and Neon's database suspends after 5 minutes idle and resumes in a few seconds.
 
 ### Mobile
 
@@ -101,7 +134,23 @@ npm run typecheck
 npm test
 ```
 
-To run on a device you first need to generate the native projects (`npx react-native init` with RN 0.75), then merge in the entries from `android/app/src/main/AndroidManifest.xml` and `ios/TrailLogMobile/Info.plist`. The API base URL is set in `src/store/authStore.ts` (`http://localhost:3000`). Change it to `http://10.0.2.2:3000` for the Android emulator, or to your machine's LAN address for a physical device.
+The app has one Android build variant per environment. Each reads its own env file at build time ([react-native-config](https://github.com/lugg/react-native-config)) and has its own application ID, so both can be installed side by side:
+
+| Variant | Env file | App name | API |
+|---|---|---|---|
+| `local` | `.env.local` (gitignored; copy from `.env.local.example`) | TrailLog (local) | `http://<PC LAN IP>:3000` |
+| `staging` | `.env.staging` (committed) | TrailLog (staging) | `https://traillog-api-staging.onrender.com` |
+
+```bash
+cp .env.local.example .env.local   # then set API_BASE_URL to your PC's LAN IP
+npm run android:local              # debug build against the local API (Metro serves the JS)
+npm run android:staging            # debug build against staging
+npm run android:staging:release    # standalone release build against staging (no Metro needed)
+```
+
+`src/config/appConfig.ts` validates the values at startup. If the env file was missing at build time, the app throws a clear error instead of calling `undefined/auth/login`. Changing an env file requires rebuilding the app, not just reloading the JS.
+
+iOS uses `.env.local` for the Debug configuration and `.env.staging` for Release (set in `ios/Podfile`). Run `cd ios && pod install` on a Mac first; the iOS project hasn't been built yet.
 
 ## API
 
@@ -127,7 +176,7 @@ All `/activities` routes need `Authorization: Bearer <token>`. Resources owned b
 | `npm test` | repo root | Mobile unit and component tests (repository and sync engine run real SQL against in-memory SQLite; native modules are mocked) |
 | `npm test` | `backend/` | Backend unit tests (conflict-detection rules) |
 | `npm run test:e2e` | `backend/` | API tests against a real PostgreSQL (needs `DATABASE_URL`) |
-| `npx detox test -c android.emu.debug` | repo root | End-to-end background-tracking flow (needs generated native projects) |
+| `npx detox test -c android.emu.debug` | repo root | End-to-end background-tracking flow (Detox native test setup not added yet) |
 
 CI workflows live in [.github/workflows/](.github/workflows/). The Detox job only runs on manual `workflow_dispatch`.
 
@@ -135,7 +184,7 @@ CI workflows live in [.github/workflows/](.github/workflows/). The Detox job onl
 
 This is an honest list of what isn't done yet:
 
-- **No buildable native projects.** Background tracking, camera and sensors are verified only through mocks so far.
+- **Not yet tested on a real device.** Background tracking, camera and sensors are verified through unit tests with mocks and an Android compile; iOS hasn't been built.
 - **Sync is push-only and manual.** There is no pull of activities created on other devices, no automatic trigger when connectivity returns, and no retry with backoff.
 - **Server-side creates are not idempotent.** If a create request succeeds but its response is lost, the next sync creates a duplicate.
 - **Conflict detection compares the local edit time with the server's `updatedAt`.** In effect this is last-write-wins by device clock, not a true "both sides changed" check.
@@ -146,4 +195,3 @@ This is an honest list of what isn't done yet:
   - The token is stored in unencrypted AsyncStorage.
   - A `401` response doesn't sign the user out.
 - **Navigation gaps:** logging in doesn't navigate away from the Login screen, and there is no link to Register and no logout button.
-- **Local-disk photo storage.** The design calls for S3-compatible storage.
