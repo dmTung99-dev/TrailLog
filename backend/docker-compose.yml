@@ -1,3 +1,5 @@
+# Local environment. `docker compose up -d --build` starts Postgres + the API;
+# `docker compose up -d postgres` starts only the database (for `npm run start:dev`).
 services:
   postgres:
     image: postgres:15
@@ -7,9 +9,35 @@ services:
       POSTGRES_PASSWORD: traillog
       POSTGRES_DB: traillog
     ports:
-      - '5432:5432'
+      - '5433:5432' # 5433 on the host: a native Postgres often already owns 5432
     volumes:
       - traillog-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U traillog']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://traillog:traillog@postgres:5432/traillog
+      # Read from backend/.env so the secret never lives in this file.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in backend/.env}
+      NODE_ENV: development
+      STORAGE_DRIVER: local
+      UPLOAD_DIR: /app/uploads
+    # Published on all interfaces, so a phone on the same Wi-Fi can reach
+    # http://<this PC's LAN IP>:3000.
+    ports:
+      - '3000:3000'
+    volumes:
+      - traillog-uploads:/app/uploads
 
 volumes:
   traillog-db:
+  traillog-uploads:

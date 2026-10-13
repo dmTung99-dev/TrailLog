@@ -1,8 +1,15 @@
 import { Module } from '@nestjs/common';
-import { LocalDiskStorageService, STORAGE_SERVICE } from './storage.service';
+import { ConfigService } from '@nestjs/config';
+import { createStorageService, STORAGE_SERVICE } from './storage.service';
 
 @Module({
-  providers: [{ provide: STORAGE_SERVICE, useClass: LocalDiskStorageService }],
+  providers: [
+    {
+      provide: STORAGE_SERVICE,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => createStorageService(config),
+    },
+  ],
   exports: [STORAGE_SERVICE],
 })
 export class StorageModule {}
