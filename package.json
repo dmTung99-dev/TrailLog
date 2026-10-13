@@ -4,19 +4,22 @@
   "private": true,
   "scripts": {
     "start": "react-native start",
-    "android": "react-native run-android",
+    "android:local": "react-native run-android --mode localDebug --appIdSuffix local",
+    "android:staging": "react-native run-android --mode stagingDebug --appIdSuffix staging",
+    "android:staging:release": "react-native run-android --mode stagingRelease --appIdSuffix staging",
     "ios": "react-native run-ios",
     "lint": "eslint . --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
     "test": "jest"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "^3.1.1",
+    "@react-native-async-storage/async-storage": "^2.2.0",
     "@react-navigation/native": "^6.1.18",
     "@react-navigation/native-stack": "^6.11.0",
     "react": "18.3.1",
     "react-native": "0.75.4",
     "react-native-background-actions": "^4.1.0",
+    "react-native-config": "^1.6.1",
     "react-native-geolocation-service": "^5.3.1",
     "react-native-get-random-values": "^1.11.0",
     "react-native-maps": "^1.20.1",
@@ -27,7 +30,7 @@
     "react-native-sqlite-storage": "^6.0.1",
     "react-native-vision-camera": "^4.7.3",
     "rxjs": "^7.8.2",
-    "uuid": "^14.0.2",
+    "uuid": "^9.0.1",
     "zustand": "^4.5.5"
   },
   "devDependencies": {
@@ -43,7 +46,7 @@
     "@types/jest": "^29.5.12",
     "@types/react": "^18.3.5",
     "@types/react-native-sqlite-storage": "^6.0.5",
-    "@types/uuid": "^10.0.0",
+    "@types/uuid": "^9.0.8",
     "better-sqlite3": "^11.3.0",
     "detox": "^20.51.4",
     "eslint": "^8.57.0",

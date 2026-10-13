@@ -1,0 +1,30 @@
+buildscript {
+    ext {
+        buildToolsVersion = "34.0.0"
+        minSdkVersion = 23
+        compileSdkVersion = 35  // react-native-background-actions 4.1 uses Android 15 APIs (Service.onTimeout)
+        targetSdkVersion = 34
+        ndkVersion = "26.1.10909125"
+        kotlinVersion = "1.9.24"
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+    }
+}
+
+apply plugin: "com.facebook.react.rootproject"
+
+// react-native-background-actions calls ServiceCompat.startForeground(..., type)
+// (androidx.core >= 1.12) but doesn't declare androidx.core itself, relying on
+// the older version React Native pulls in transitively. Raise it everywhere.
+subprojects {
+    configurations.all {
+        resolutionStrategy.force "androidx.core:core:1.13.1"
+    }
+}

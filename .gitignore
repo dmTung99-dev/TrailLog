@@ -17,3 +17,26 @@ Thumbs.db
 
 # Superpowers scratch (progress ledger, subagent diffs) — never commit
 .superpowers/
+
+# Local photo uploads (backend LocalDiskStorageService)
+uploads/
+
+# Mobile app env for the "local" build variant (your LAN IP)
+.env.local
+
+# Android (from the React Native template)
+.gradle/
+android/app/.cxx/
+local.properties
+*.hprof
+*.keystore
+!debug.keystore
+.kotlin/
+
+# iOS (from the React Native template)
+ios/build/
+ios/Pods/
+ios/.xcode.env.local
+xcuserdata/
+*.xcworkspace/xcuserdata/
+/vendor/bundle/

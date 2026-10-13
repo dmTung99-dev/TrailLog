@@ -15,6 +15,8 @@ module.exports = {
     '^react-native-sensors$': '<rootDir>/src/__mocks__/react-native-sensors.js',
     '^react-native-vision-camera$': '<rootDir>/src/__mocks__/react-native-vision-camera.js',
     '^react-native-maps$': '<rootDir>/src/__mocks__/react-native-maps.js',
+    '^react-native-config$': '<rootDir>/src/__mocks__/react-native-config.js',
+    '^@react-native-async-storage/async-storage$': '@react-native-async-storage/async-storage/jest/async-storage-mock',
   },
   setupFilesAfterEnv: [],
   testEnvironment: 'node',

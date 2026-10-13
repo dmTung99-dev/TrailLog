@@ -6,8 +6,8 @@ module.exports = {
   apps: {
     'android.debug': {
       type: 'android.apk',
-      binaryPath: 'android/app/build/outputs/apk/debug/app-debug.apk',
-      build: 'cd android && ./gradlew assembleDebug assembleAndroidTest -DtestBuildType=debug',
+      binaryPath: 'android/app/build/outputs/apk/local/debug/app-local-debug.apk',
+      build: 'cd android && ./gradlew assembleLocalDebug assembleLocalDebugAndroidTest -DtestBuildType=debug',
     },
   },
   devices: {

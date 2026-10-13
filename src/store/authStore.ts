@@ -1,10 +1,9 @@
 import { create } from 'zustand';
 import { createApiClient } from '../api/apiClient';
 import { tokenStorage } from '../api/tokenStorage';
+import { appConfig } from '../config/appConfig';
 
-export const API_BASE_URL = 'http://localhost:3000';
-
-const apiClient = createApiClient(API_BASE_URL, () => tokenStorage.getToken());
+const apiClient = createApiClient(appConfig.apiBaseUrl, () => tokenStorage.getToken());
 
 interface AuthStoreState {
   status: 'checking' | 'signedOut' | 'signedIn';
